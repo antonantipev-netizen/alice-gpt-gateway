@@ -3,6 +3,7 @@ import re
 import json
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+from threading import Lock, Thread
 
 import requests
 import caldav
@@ -10,6 +11,9 @@ from icalendar import Calendar as ICalendar, Event as ICalEvent, Alarm
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
+
+VKUSVILL_JOBS = {}
+VKUSVILL_JOBS_LOCK = Lock()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -599,6 +603,48 @@ def is_vkusvill_intent(text: str) -> bool:
     return any(trigger in low for trigger in triggers)
 
 
+def get_vkusvill_job_key(session: dict) -> str:
+    user = session.get("user", {}) if isinstance(session, dict) else {}
+    if isinstance(user, dict) and user.get("user_id"):
+        return f"user:{user['user_id']}"
+    application = session.get("application", {}) if isinstance(session, dict) else {}
+    if isinstance(application, dict) and application.get("application_id"):
+        return f"app:{application['application_id']}"
+    return f"session:{session.get('session_id', 'unknown')}"
+
+
+def is_vkusvill_status_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    phrases = (
+        "корзина готова", "готова корзина", "что с корзиной",
+        "покажи корзину", "дай корзину", "ссылка на корзину",
+        "где корзина", "где ссылка",
+    )
+    return any(p in low for p in phrases)
+
+
+def start_vkusvill_job(job_key: str, user_text: str) -> None:
+    def worker():
+        try:
+            result = call_vkusvill_agent(user_text)
+            payload = {"status": "done", "result": result}
+        except Exception as exc:
+            print(f"VkusVill async error: {exc}", flush=True)
+            payload = {"status": "error", "error": str(exc)}
+        with VKUSVILL_JOBS_LOCK:
+            VKUSVILL_JOBS[job_key] = payload
+
+    with VKUSVILL_JOBS_LOCK:
+        VKUSVILL_JOBS[job_key] = {"status": "working"}
+
+    Thread(target=worker, daemon=True).start()
+
+
+def get_vkusvill_job(job_key: str) -> dict:
+    with VKUSVILL_JOBS_LOCK:
+        return dict(VKUSVILL_JOBS.get(job_key, {}))
+
+
 def extract_responses_text(payload: dict) -> str:
     parts = []
     for item in payload.get("output", []):
@@ -934,9 +980,24 @@ def alice():
 
     try:
         timezone_name = data.get("meta", {}).get("timezone") or "Europe/Moscow"
+        vkusvill_job_key = get_vkusvill_job_key(session)
 
-        if is_vkusvill_intent(command_for_memory):
-            answer = call_vkusvill_agent(command_for_memory)
+        if is_vkusvill_status_intent(command_for_memory):
+            job = get_vkusvill_job(vkusvill_job_key)
+            if job.get("status") == "done":
+                answer = job.get("result") or "Корзина готова, но ссылка не найдена."
+            elif job.get("status") == "error":
+                answer = "Не получилось собрать корзину. Повтори команду ещё раз."
+            elif job.get("status") == "working":
+                answer = "Корзина ещё собирается. Спроси меня о ней ещё раз."
+            else:
+                answer = "У меня сейчас нет активной корзины ВкусВилла."
+        elif is_vkusvill_intent(command_for_memory):
+            start_vkusvill_job(vkusvill_job_key, command_for_memory)
+            answer = (
+                "Принял. Собираю корзину ВкусВилла. "
+                "Потом скажи: Джарвис, корзина готова?"
+            )
         elif is_calendar_intent(command_for_memory):
             answer = call_calendar_agent(command_for_memory, timezone_name)
         elif is_web_search_intent(command_for_memory):
@@ -963,7 +1024,7 @@ def alice():
         answer = "Сейчас не получилось связаться с ИИ. Попробуй ещё раз."
 
     tts_answer = None
-    if is_vkusvill_intent(command_for_memory) and "http" in answer:
+    if (is_vkusvill_intent(command_for_memory) or is_vkusvill_status_intent(command_for_memory)) and "http" in answer:
         tts_answer = (
             "Готово. Я собрал корзину ВкусВилла. "
             "Ссылка есть в текстовом ответе."
