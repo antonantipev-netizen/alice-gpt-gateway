@@ -33,7 +33,9 @@ MEMORY_SHOW_PHRASES = {
     "что ты обо мне помнишь",
     "что ты помнишь обо мне",
     "что ты запомнил обо мне",
-    "что ты запомнил"
+    "что ты запомнил",
+    "что помнишь обо мне",
+    "что помнишь"
 }
 
 MEMORY_CLEAR_PHRASES = {
@@ -56,23 +58,39 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def extract_remember_payload(command: str) -> str | None:
+def strip_jarvis_prefix(command: str) -> str:
     normalized = normalize_text(command)
     low = normalized.lower()
+    prefixes = [
+        "джарвис ассистент, ",
+        "джарвис ассистент ",
+        "джарвис, ",
+        "джарвис ",
+    ]
+    for prefix in prefixes:
+        if low.startswith(prefix):
+            return normalized[len(prefix):].strip()
+    return normalized
 
+
+def extract_remember_payload(command: str) -> str | None:
+    normalized = strip_jarvis_prefix(command)
+    low = normalized.lower()
     prefixes = [
         "запомни, что ",
         "запомни что ",
         "запомни, ",
         "запомни ",
     ]
-
     for prefix in prefixes:
         if low.startswith(prefix):
             payload = normalized[len(prefix):].strip(" .")
             return payload or None
-
     return None
+
+
+def state_size(value: str) -> int:
+    return len(("{\"memory\":\"" + value + "\"}").encode("utf-8"))
 
 
 def compact_memory(current: str, new_fact: str) -> str:
@@ -92,29 +110,28 @@ def compact_memory(current: str, new_fact: str) -> str:
         seen.add(key)
         facts.append(item)
 
-    # Yandex state is limited to 1 KB. Keep a conservative text budget.
-    while facts and len(" | ".join(facts)) > 620:
+    while facts and state_size(" | ".join(facts)) > 800:
         facts.pop(0)
 
     return " | ".join(facts)
 
 
-def trim_history(history: list[dict], max_chars: int = 650) -> list[dict]:
+def trim_history(history: list[dict], max_chars: int = 500) -> list[dict]:
     clean = []
 
-    for item in history[-8:]:
+    for item in history[-6:]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
-        content = normalize_text(str(item.get("content", "")))
-        if role not in {"user", "assistant"} or not content:
+        item_content = normalize_text(str(item.get("content", "")))
+        if role not in {"user", "assistant"} or not item_content:
             continue
-        clean.append({"role": role, "content": content[:220]})
+        clean.append({"role": role, "content": item_content[:160]})
 
-    while clean and len(str(clean)) > max_chars:
+    while clean and len(str(clean).encode("utf-8")) > max_chars:
         clean.pop(0)
 
-    return clean[-6:]
+    return clean[-4:]
 
 
 def get_long_memory(data: dict) -> str:
@@ -124,13 +141,13 @@ def get_long_memory(data: dict) -> str:
     if isinstance(user_state, dict):
         memory = user_state.get("memory")
         if isinstance(memory, str) and memory.strip():
-            return normalize_text(memory)[:620]
+            return normalize_text(memory)
 
     app_state = state.get("application", {})
     if isinstance(app_state, dict):
         memory = app_state.get("memory")
         if isinstance(memory, str) and memory.strip():
-            return normalize_text(memory)[:620]
+            return normalize_text(memory)
 
     return ""
 
@@ -200,10 +217,9 @@ def make_alice_response(
     history: list[dict],
     memory: str,
     end_session: bool = False,
+    clear_memory: bool = False,
 ) -> dict:
-    memory_state = {"memory": memory[:620]}
-
-    return {
+    result = {
         "version": version,
         "session": session,
         "response": {
@@ -214,11 +230,23 @@ def make_alice_response(
         "session_state": {
             "history": trim_history(history),
         },
-        # user_state_update gives cross-device memory for authorized Yandex ID users.
-        "user_state_update": memory_state,
-        # application_state is a fallback for a specific device/application instance.
-        "application_state": memory_state,
     }
+
+    user_present = isinstance(session.get("user"), dict) and bool(
+        session.get("user", {}).get("user_id")
+    )
+
+    if clear_memory:
+        if user_present:
+            result["user_state_update"] = {"memory": None}
+        result["application_state"] = {}
+    else:
+        memory_state = {"memory": memory}
+        if user_present:
+            result["user_state_update"] = memory_state
+        result["application_state"] = memory_state
+
+    return result
 
 
 @app.get("/")
@@ -272,9 +300,26 @@ def alice():
         or ""
     ).strip()
 
-    low = normalize_text(command).lower()
+    command_for_memory = strip_jarvis_prefix(command)
+    low = normalize_text(command_for_memory).lower()
     history = get_session_history(data)
     memory = get_long_memory(data)
+
+    state = data.get("state", {})
+    session_user = session.get("user", {}) if isinstance(session, dict) else {}
+    app_obj = session.get("application", {}) if isinstance(session, dict) else {}
+
+    print(
+        "MEMDBG "
+        f"new={session.get('new')} "
+        f"user_present={bool(isinstance(session_user, dict) and session_user.get('user_id'))} "
+        f"app_present={bool(isinstance(app_obj, dict) and app_obj.get('application_id'))} "
+        f"state_user={bool(isinstance(state.get('user'), dict) and state.get('user'))} "
+        f"state_app={bool(isinstance(state.get('application'), dict) and state.get('application'))} "
+        f"memory_len={len(memory)} "
+        f"command={command_for_memory[:80]!r}",
+        flush=True,
+    )
 
     if low in EXIT_WORDS:
         return jsonify(
@@ -289,14 +334,14 @@ def alice():
         )
 
     if low in MEMORY_CLEAR_PHRASES:
-        memory = ""
         return jsonify(
             make_alice_response(
                 version,
                 session,
                 "Готово. Долговременную память очистил.",
                 history,
-                memory,
+                "",
+                clear_memory=True,
             )
         )
 
@@ -305,7 +350,7 @@ def alice():
         memory = compact_memory(memory, remember_payload)
         answer = f"Запомнил: {remember_payload}."
         history = history + [
-            {"role": "user", "content": command},
+            {"role": "user", "content": command_for_memory},
             {"role": "assistant", "content": answer},
         ]
 
@@ -325,11 +370,11 @@ def alice():
         else:
             answer = (
                 "Пока в долговременной памяти ничего нет. "
-                "Скажи, например: Джарвис, запомни, что я люблю футбол."
+                "Скажи: запомни, что я люблю футбол."
             )
 
         history = history + [
-            {"role": "user", "content": command},
+            {"role": "user", "content": command_for_memory},
             {"role": "assistant", "content": answer},
         ]
 
@@ -343,7 +388,7 @@ def alice():
             )
         )
 
-    if not command:
+    if not command_for_memory:
         answer = "Я на связи, Антон. Спрашивай."
         return jsonify(
             make_alice_response(
@@ -356,9 +401,9 @@ def alice():
         )
 
     try:
-        answer = call_groq(command, history, memory)
+        answer = call_groq(command_for_memory, history, memory)
         history = history + [
-            {"role": "user", "content": command},
+            {"role": "user", "content": command_for_memory},
             {"role": "assistant", "content": answer},
         ]
     except requests.Timeout:
