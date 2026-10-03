@@ -181,6 +181,90 @@ def infer_auto_memory(command: str) -> str | None:
     return None
 
 
+def split_memory(memory: str) -> tuple[list[str], list[str]]:
+    personal = []
+    work = []
+    for item in (memory.split(" | ") if memory else []):
+        item = item.strip(" .|")
+        if not item:
+            continue
+        if item.startswith("WORK["):
+            work.append(item)
+        else:
+            personal.append(item)
+    return personal, work
+
+
+def personal_memory_only(memory: str) -> str:
+    personal, _ = split_memory(memory)
+    return " | ".join(personal)
+
+
+def work_memory_only(memory: str) -> list[str]:
+    _, work = split_memory(memory)
+    return work[-5:]
+
+
+def normalize_project_name(raw_name: str) -> str:
+    raw = normalize_text(raw_name).strip(" .,:;-")
+    low = raw.lower()
+    aliases = {
+        "геленджик": "КСК Геленджик",
+        "кск": "КСК Геленджик",
+        "кск геленджик": "КСК Геленджик",
+        "планетарий": "Планетарий",
+        "шепелюгинская": "Шепелюгинская 26019",
+        "зал министра": "Зал Министра 25039",
+        "сколково": "Сколково музей",
+        "сколково музей": "Сколково музей",
+    }
+    if low in aliases:
+        return aliases[low]
+
+    context = load_work_context()
+    projects = context.get("projects", {}) if isinstance(context, dict) else {}
+    for name in projects:
+        if low in name.lower() or name.lower() in low:
+            return name
+    return raw[:80] or "Работа"
+
+
+def extract_work_update(command: str) -> tuple[str, str] | None:
+    text = normalize_text(strip_jarvis_prefix(command))
+    patterns = [
+        r"^(?:запиши|зафиксируй|сохрани)\s+(?:обновление\s+)?по\s+(?:объекту\s+)?(.+?)\s*[:,-]\s*(.+)$",
+        r"^обновление\s+по\s+(?:объекту\s+)?(.+?)\s*[:,-]\s*(.+)$",
+        r"^по\s+объекту\s+(.+?)\s*[:,-]\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.I)
+        if match:
+            project = normalize_project_name(match.group(1))
+            note = normalize_text(match.group(2)).strip(" .")
+            if project and note:
+                return project, note[:260]
+    return None
+
+
+def compact_work_memory(current: str, project: str, note: str) -> str:
+    personal, work = split_memory(current)
+    entry = f"WORK[{project}]: {note}"
+    if entry not in work:
+        work.append(entry)
+    work = work[-5:]
+
+    def join_all() -> str:
+        return " | ".join(personal + work)
+
+    while work and state_size(join_all()) > 800:
+        work.pop(0)
+
+    while personal and state_size(join_all()) > 800:
+        personal.pop(0)
+
+    return join_all()
+
+
 def forget_from_memory(current: str, needle: str) -> tuple[str, bool]:
     needle_low = normalize_text(needle).lower()
     facts = [x.strip() for x in current.split(" | ") if x.strip()]
@@ -266,11 +350,12 @@ def get_session_history(data: dict) -> list[dict]:
 
 def build_system_prompt(memory: str) -> str:
     prompt = BASE_SYSTEM_PROMPT + " " + PERSONAL_PROFILE
+    personal_memory = personal_memory_only(memory)
 
-    if memory:
+    if personal_memory:
         prompt += (
-            " Долговременная память об Антоне: "
-            + memory
+            " Долговременная личная память об Антоне: "
+            + personal_memory
             + ". Используй эти сведения только когда они уместны."
         )
 
@@ -332,7 +417,7 @@ def is_work_intent(text: str) -> bool:
     return any(trigger in low for trigger in triggers)
 
 
-def call_work_agent(user_text: str, history: list[dict]) -> str:
+def call_work_agent(user_text: str, history: list[dict], memory: str = "") -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured")
 
@@ -340,6 +425,7 @@ def call_work_agent(user_text: str, history: list[dict]) -> str:
     if not context:
         return "Рабочая база пока недоступна."
 
+    recent_updates = work_memory_only(memory)
     history_text = []
     for item in trim_history(history):
         role = "Антон" if item.get("role") == "user" else "Джарвис"
@@ -356,6 +442,13 @@ def call_work_agent(user_text: str, history: list[dict]) -> str:
         + json.dumps(context, ensure_ascii=False)
         + "\n\n"
     )
+
+    if recent_updates:
+        prompt += (
+            "СВЕЖИЕ ОБНОВЛЕНИЯ, КОТОРЫЕ АНТОН НАДИКТОВАЛ ДЖАРВИСУ:\n"
+            + "\n".join(recent_updates)
+            + "\n\n"
+        )
 
     if history_text:
         prompt += "КОНТЕКСТ ДИАЛОГА:\n" + " | ".join(history_text) + "\n\n"
@@ -795,6 +888,25 @@ def alice():
             )
         )
 
+    work_update = extract_work_update(command)
+    if work_update:
+        project, note = work_update
+        memory = compact_work_memory(memory, project, note)
+        answer = f"Записал по {project}: {note}."
+        history = history + [
+            {"role": "user", "content": command_for_memory},
+            {"role": "assistant", "content": answer},
+        ]
+        return jsonify(
+            make_alice_response(
+                version,
+                session,
+                answer,
+                history,
+                memory,
+            )
+        )
+
     remember_payload = extract_remember_payload(command)
     if remember_payload:
         memory = compact_memory(memory, remember_payload)
@@ -815,11 +927,12 @@ def alice():
         )
 
     if command_key in MEMORY_SHOW_PHRASES:
-        if memory:
-            answer = "Я помню: " + memory.replace(" | ", "; ") + "."
+        personal_memory = personal_memory_only(memory)
+        if personal_memory:
+            answer = "Я помню: " + personal_memory.replace(" | ", "; ") + "."
         else:
             answer = (
-                "Пока в долговременной памяти ничего нет. "
+                "Пока в личной долговременной памяти ничего нет. "
                 "Скажи: запомни, что я люблю футбол."
             )
 
@@ -870,7 +983,7 @@ def alice():
                 "Потом скажи: Джарвис, корзина готова?"
             )
         elif is_work_intent(command_for_memory):
-            answer = call_work_agent(command_for_memory, history)
+            answer = call_work_agent(command_for_memory, history, memory)
         elif is_web_search_intent(command_for_memory):
             answer = call_web_agent(command_for_memory, history, memory)
         else:
