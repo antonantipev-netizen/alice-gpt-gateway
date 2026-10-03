@@ -1020,10 +1020,19 @@ def alice():
 
     tts_answer = None
     if (is_vkusvill_intent(command_for_memory) or is_vkusvill_status_intent(command_for_memory)) and "http" in answer:
-        tts_answer = (
-            "Готово. Я собрал корзину ВкусВилла. "
-            "Ссылка есть в текстовом ответе."
-        )
+        count_match = re.search(r"Добавил:\s*(.+?)\.\s*https?://", answer)
+        item_count = 0
+        if count_match:
+            item_count = len([x for x in count_match.group(1).split(",") if x.strip()])
+        if item_count:
+            tts_answer = (
+                f"Корзина готова. Я добавил {item_count} товара. "
+                "Ссылка на корзину есть в чате."
+            )
+        else:
+            tts_answer = (
+                "Корзина готова. Ссылка на корзину есть в чате."
+            )
 
     return jsonify(
         make_alice_response(

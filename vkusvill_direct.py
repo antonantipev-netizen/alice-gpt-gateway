@@ -96,15 +96,43 @@ def parse_targets(text: str) -> list[str]:
 
 
 def _choose_product(query: str, items: list[dict]) -> dict | None:
-    q = query.lower()
+    q = query.lower().strip()
+    tokens = [t for t in re.findall(r"[а-яa-z0-9]+", q) if len(t) >= 3]
+
+    penalties = {
+        "яйца": ["копчен", "марин", "перепел", "белок", "желток"],
+        "яйцо": ["копчен", "марин", "перепел", "белок", "желток"],
+        "хлеб": ["хлебц", "сухар", "гренк", "лаваш"],
+        "творог": ["детск", "десерт", "сырок", "мали", "клубн", "ванил", "шокол"],
+        "молоко": ["кокос", "минд", "овсян", "соев", "безлакт"],
+    }
+
+    boosts = {
+        "яйца": ["курин", "с0", "с1", "десят"],
+        "яйцо": ["курин", "с0", "с1", "десят"],
+        "хлеб": ["пшен", "ржан", "бородин", "нарез"],
+        "творог": ["5%", "9%", "2%", "обезжир"],
+        "молоко": ["пастер", "ультрапастер", "1%", "2.5%", "3.2%"],
+    }
+
     ranked = []
     for item in items:
         pid = _product_id(item)
         if not pid:
             continue
         name = _name(item).lower()
-        relevance = sum(1 for token in re.findall(r"[а-яa-z0-9]+", q) if len(token) >= 3 and token[:5] in name)
+        relevance = sum(2 for token in tokens if token[:5] in name)
+
+        for bad in penalties.get(q, []):
+            if bad in name:
+                relevance -= 4
+
+        for good in boosts.get(q, []):
+            if good in name:
+                relevance += 1
+
         ranked.append((relevance, _rating(item), -_price(item), item))
+
     if not ranked:
         return None
     ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
