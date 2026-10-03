@@ -580,10 +580,21 @@ def is_vkusvill_status_intent(text: str) -> bool:
 def start_vkusvill_job(job_key: str, user_text: str) -> None:
     def worker():
         try:
-            result = call_vkusvill_agent(user_text)
-            payload = {"status": "done", "result": result}
+            direct = build_cart_direct_sync(user_text)
+            if direct.get("success") and direct.get("cart_url"):
+                names = [item.get("name") for item in direct.get("selected", []) if item.get("name")]
+                summary = ", ".join(names[:6])
+                result = "Корзина готова."
+                if summary:
+                    result += f" Добавил: {summary}."
+                result += f" {direct['cart_url']}"
+                payload = {"status": "done", "result": result}
+                print(f"VkusVill direct success: items={len(names)} url={direct['cart_url']}", flush=True)
+            else:
+                payload = {"status": "error", "error": direct.get("message") or "cart_not_created"}
+                print(f"VkusVill direct failed: {direct}", flush=True)
         except Exception as exc:
-            print(f"VkusVill async error: {exc}", flush=True)
+            print(f"VkusVill direct async error: {exc}", flush=True)
             payload = {"status": "error", "error": str(exc)}
         with VKUSVILL_JOBS_LOCK:
             VKUSVILL_JOBS[job_key] = payload
