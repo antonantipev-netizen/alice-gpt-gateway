@@ -91,6 +91,91 @@ def extract_remember_payload(command: str) -> str | None:
     return None
 
 
+
+def extract_forget_payload(command: str) -> str | None:
+    normalized = strip_jarvis_prefix(command)
+    low = normalized.lower()
+    prefixes = [
+        "забудь про ",
+        "забудь, что ",
+        "забудь что ",
+        "удали из памяти ",
+        "не помни ",
+    ]
+    for prefix in prefixes:
+        if low.startswith(prefix):
+            payload = normalized[len(prefix):].strip(" .")
+            return payload or None
+    return None
+
+
+def infer_auto_memory(command: str) -> str | None:
+    """Save only stable, non-sensitive facts stated by the user."""
+    text = normalize_text(strip_jarvis_prefix(command)).strip(" .")
+    low = text.lower()
+
+    if not text or len(text) > 180:
+        return None
+
+    # Questions and explicit opt-out are never auto-saved.
+    question_starters = (
+        "кто ", "что ", "где ", "когда ", "как ", "почему ", "зачем ",
+        "можно ", "нужно ", "сколько ", "какой ", "какая ", "какие ",
+    )
+    if "?" in text or low.startswith(question_starters):
+        return None
+    if "не запоминай" in low or "не надо запоминать" in low:
+        return None
+
+    # Do not automatically persist secrets, health, exact location, finance, or other sensitive details.
+    sensitive_markers = (
+        "пароль", "пин", "pin", "код из смс", "cvv", "cvc", "номер карты",
+        "паспорт", "снилс", "инн", "адрес", "улица", "квартира",
+        "диагноз", "болит", "болезн", "лекар", "давление", "вес ", "рост ",
+        "зарплат", "доход", "долг", "кредит", "счет ", "счёт ",
+    )
+    if any(marker in low for marker in sensitive_markers):
+        return None
+
+    transient_markers = (
+        "сегодня", "завтра", "вчера", "сейчас", "на этой неделе",
+        "временно", "сегодня вечером", "сегодня утром",
+    )
+    if any(marker in low for marker in transient_markers):
+        return None
+
+    patterns = [
+        (r"^я люблю\s+(.+)$", "Любит: {}"),
+        (r"^мне нравится\s+(.+)$", "Нравится: {}"),
+        (r"^я предпочитаю\s+(.+)$", "Предпочитает: {}"),
+        (r"^я не люблю\s+(.+)$", "Не любит: {}"),
+        (r"^мой любимый\s+(.+)$", "Любимое: {}"),
+        (r"^моя любимая\s+(.+)$", "Любимое: {}"),
+        (r"^мои любимые\s+(.+)$", "Любимое: {}"),
+        (r"^я работаю\s+(.+)$", "Работа: {}"),
+        (r"^у меня машина\s+(.+)$", "Машина: {}"),
+        (r"^у меня автомобиль\s+(.+)$", "Машина: {}"),
+        (r"^у меня телефон\s+(.+)$", "Телефон: {}"),
+        (r"^у меня ноутбук\s+(.+)$", "Ноутбук: {}"),
+    ]
+
+    for pattern, template in patterns:
+        match = re.match(pattern, low, flags=re.IGNORECASE)
+        if match:
+            value = text[match.start(1):match.end(1)].strip(" .")
+            if 2 <= len(value) <= 120:
+                return template.format(value)
+
+    return None
+
+
+def forget_from_memory(current: str, needle: str) -> tuple[str, bool]:
+    needle_low = normalize_text(needle).lower()
+    facts = [x.strip() for x in current.split(" | ") if x.strip()]
+    kept = [x for x in facts if needle_low not in x.lower()]
+    return " | ".join(kept), len(kept) != len(facts)
+
+
 def state_size(value: str) -> int:
     return len(("{\"memory\":\"" + value + "\"}").encode("utf-8"))
 
@@ -402,6 +487,7 @@ def alice():
 
     command_for_memory = strip_jarvis_prefix(command)
     low = normalize_text(command_for_memory).lower()
+    command_key = re.sub(r"[?!.,]+$", "", low).strip()
     history = get_session_history(data)
     memory = get_long_memory(data)
 
@@ -421,7 +507,7 @@ def alice():
         flush=True,
     )
 
-    if low in EXIT_WORDS:
+    if command_key in EXIT_WORDS:
         return jsonify(
             make_alice_response(
                 version,
@@ -433,7 +519,7 @@ def alice():
             )
         )
 
-    if low in MEMORY_CLEAR_PHRASES:
+    if command_key in MEMORY_CLEAR_PHRASES:
         return jsonify(
             make_alice_response(
                 version,
@@ -442,6 +528,28 @@ def alice():
                 history,
                 "",
                 clear_memory=True,
+            )
+        )
+
+    forget_payload = extract_forget_payload(command)
+    if forget_payload:
+        memory, removed = forget_from_memory(memory, forget_payload)
+        answer = (
+            f"Забыл всё, что связано с: {forget_payload}."
+            if removed
+            else f"В памяти ничего про {forget_payload} не нашёл."
+        )
+        history = history + [
+            {"role": "user", "content": command_for_memory},
+            {"role": "assistant", "content": answer},
+        ]
+        return jsonify(
+            make_alice_response(
+                version,
+                session,
+                answer,
+                history,
+                memory,
             )
         )
 
@@ -464,7 +572,7 @@ def alice():
             )
         )
 
-    if low in MEMORY_SHOW_PHRASES:
+    if command_key in MEMORY_SHOW_PHRASES:
         if memory:
             answer = "Я помню: " + memory.replace(" | ", "; ") + "."
         else:
@@ -510,6 +618,14 @@ def alice():
             {"role": "user", "content": command_for_memory},
             {"role": "assistant", "content": answer},
         ]
+
+        if not is_vkusvill_intent(command_for_memory):
+            auto_fact = infer_auto_memory(command_for_memory)
+            if auto_fact:
+                before = memory
+                memory = compact_memory(memory, auto_fact)
+                if memory != before:
+                    print(f"AUTOMEM saved={auto_fact!r}", flush=True)
     except requests.Timeout:
         answer = "Я не успел получить ответ. Спроси ещё раз покороче."
     except Exception as exc:
