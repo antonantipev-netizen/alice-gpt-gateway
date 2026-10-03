@@ -380,7 +380,7 @@ def clean_bitrix_description(value: str) -> str:
     text = re.sub(r"</(?:p|div|li)>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\[/?(?:B|I|U|LIST|\*|QUOTE)(?:=[^\]]*)?\]", "", text, flags=re.I)
-    text = re.sub(r"\[URL=[^\]]+\]([^]*?)\[/URL\]", r"\1", text, flags=re.I)
+    text = re.sub(r"\[URL=[^\]]+\]([\s\S]*?)\[/URL\]", r"\1", text, flags=re.I)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&")
     return normalize_text(text)[:700]
 
