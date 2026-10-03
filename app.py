@@ -692,7 +692,6 @@ def make_alice_response(
 ) -> dict:
     result = {
         "version": version,
-        "session": session,
         "response": {
             "text": answer,
             "tts": tts_answer or answer,
