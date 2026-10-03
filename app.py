@@ -1,6 +1,12 @@
 import os
 import re
+import json
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+
 import requests
+import caldav
+from icalendar import Calendar as ICalendar, Event as ICalEvent, Alarm
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -11,6 +17,11 @@ GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
+
+YANDEX_CALDAV_URL = os.getenv("YANDEX_CALDAV_URL", "https://caldav.yandex.ru").strip()
+YANDEX_CALDAV_USER = os.getenv("YANDEX_CALDAV_USER", "").strip()
+YANDEX_CALDAV_PASSWORD = os.getenv("YANDEX_CALDAV_PASSWORD", "").strip()
+YANDEX_CALENDAR_NAME = os.getenv("YANDEX_CALENDAR_NAME", "").strip()
 
 PERSONAL_PROFILE = (
     "Пользователя зовут Антон. Обращайся к нему на ты. "
@@ -299,6 +310,223 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
 
 
 
+def is_calendar_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    triggers = (
+        "что у меня сегодня", "что у меня завтра", "что у меня послезавтра",
+        "что в календаре", "покажи календарь", "мои встречи", "мои события",
+        "создай встречу", "добавь встречу", "поставь встречу",
+        "добавь событие", "создай событие", "запиши в календарь",
+        "добавь в календарь", "напомни мне", "поставь напоминание",
+    )
+    return any(trigger in low for trigger in triggers)
+
+
+def calendar_configured() -> bool:
+    return bool(YANDEX_CALDAV_USER and YANDEX_CALDAV_PASSWORD)
+
+
+def get_yandex_calendar():
+    if not calendar_configured():
+        raise RuntimeError("Yandex Calendar is not configured")
+
+    client = caldav.DAVClient(
+        url=YANDEX_CALDAV_URL,
+        username=YANDEX_CALDAV_USER,
+        password=YANDEX_CALDAV_PASSWORD,
+    )
+    principal = client.principal()
+    calendars = principal.calendars()
+
+    if not calendars:
+        raise RuntimeError("No calendars found")
+
+    if YANDEX_CALENDAR_NAME:
+        wanted = YANDEX_CALENDAR_NAME.lower()
+        for item in calendars:
+            try:
+                name = (item.name or "").strip()
+            except Exception:
+                name = ""
+            if name.lower() == wanted:
+                return item
+
+    return calendars[0]
+
+
+def parse_calendar_command(user_text: str, timezone_name: str) -> dict:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        timezone_name = "Europe/Moscow"
+        tz = ZoneInfo(timezone_name)
+
+    now = datetime.now(tz)
+
+    prompt = f"""
+Ты парсер команд календаря. Верни ТОЛЬКО JSON, без markdown.
+Текущее локальное время: {now.isoformat()}
+Часовой пояс: {timezone_name}
+
+Поддерживаются действия:
+1) list — показать события за день.
+2) create — создать встречу/событие/напоминание.
+
+Формат для list:
+{{"action":"list","date":"YYYY-MM-DD"}}
+
+Формат для create:
+{{"action":"create","title":"краткое название","start":"ISO-8601 с часовым поясом","duration_minutes":60,"reminder_minutes":15}}
+
+Правила:
+- Если пользователь говорит "напомни", action=create.
+- Для напоминания title должен начинаться с "Напоминание: ".
+- Если длительность не указана: встреча 60 минут, простое напоминание 15 минут.
+- Если время создания события не указано, верни поле "needs_clarification":"time".
+- Если для list дата не указана, используй сегодня.
+- Не придумывай участников, адрес или описание.
+
+Команда пользователя: {user_text}
+""".strip()
+
+    response = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "Ты возвращаешь только корректный JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "max_completion_tokens": 220,
+        },
+        timeout=3.2,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Calendar parse failed: {response.status_code}")
+
+    raw = response.json()["choices"][0]["message"]["content"].strip()
+    raw = re.sub(r"^\x60\x60\x60(?:json)?\s*|\s*\x60\x60\x60$", "", raw, flags=re.I)
+    return json.loads(raw)
+
+
+def create_calendar_event(spec: dict, timezone_name: str) -> str:
+    if spec.get("needs_clarification") == "time":
+        return "На какое время поставить?"
+
+    start_raw = spec.get("start")
+    title = normalize_text(str(spec.get("title", "Событие")))
+    if not start_raw:
+        return "На какое время поставить?"
+
+    start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=ZoneInfo(timezone_name or "Europe/Moscow"))
+
+    duration = int(spec.get("duration_minutes") or 60)
+    duration = max(5, min(duration, 12 * 60))
+    reminder = int(spec.get("reminder_minutes") or 15)
+    reminder = max(0, min(reminder, 7 * 24 * 60))
+
+    ical = ICalendar()
+    ical.add("prodid", "-//Jarvis Alice//RU")
+    ical.add("version", "2.0")
+
+    event = ICalEvent()
+    event.add("summary", title)
+    event.add("dtstart", start)
+    event.add("dtend", start + timedelta(minutes=duration))
+    event.add("dtstamp", datetime.now(start.tzinfo))
+
+    if reminder > 0:
+        alarm = Alarm()
+        alarm.add("action", "DISPLAY")
+        alarm.add("description", title)
+        alarm.add("trigger", timedelta(minutes=-reminder))
+        event.add_component(alarm)
+
+    ical.add_component(event)
+    calendar = get_yandex_calendar()
+    calendar.save_event(ical.to_ical().decode("utf-8"))
+
+    local_start = start.astimezone(ZoneInfo(timezone_name or "Europe/Moscow"))
+    return f"Готово. {title} — {local_start.strftime('%d.%m в %H:%M')}."
+
+
+def list_calendar_events(target_date: str, timezone_name: str) -> str:
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = ZoneInfo("Europe/Moscow")
+
+    day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end = start + timedelta(days=1)
+
+    calendar = get_yandex_calendar()
+    try:
+        items = calendar.search(start=start, end=end, event=True, expand=True)
+    except Exception:
+        items = calendar.date_search(start=start, end=end)
+
+    found = []
+    for item in items:
+        try:
+            data = item.data
+            parsed = ICalendar.from_ical(data)
+            for component in parsed.walk("VEVENT"):
+                summary = str(component.get("SUMMARY", "Событие"))
+                dtstart = component.decoded("DTSTART")
+                if isinstance(dtstart, datetime):
+                    if dtstart.tzinfo is None:
+                        dtstart = dtstart.replace(tzinfo=tz)
+                    when = dtstart.astimezone(tz).strftime("%H:%M")
+                elif isinstance(dtstart, date):
+                    when = "весь день"
+                else:
+                    when = ""
+                found.append((when, summary))
+        except Exception:
+            continue
+
+    if not found:
+        return f"На {day.strftime('%d.%m')} событий нет."
+
+    found.sort(key=lambda x: x[0])
+    parts = [f"{when} — {title}" for when, title in found[:8]]
+    extra = len(found) - len(parts)
+    answer = f"На {day.strftime('%d.%m')}: " + "; ".join(parts)
+    if extra > 0:
+        answer += f". И ещё {extra}."
+    return clean_for_voice(answer)
+
+
+def call_calendar_agent(user_text: str, timezone_name: str) -> str:
+    if not calendar_configured():
+        return (
+            "Календарь пока не подключён. "
+            "Нужно один раз добавить логин Яндекса и пароль приложения в Render."
+        )
+
+    spec = parse_calendar_command(user_text, timezone_name)
+    action = spec.get("action")
+
+    if action == "list":
+        return list_calendar_events(spec.get("date"), timezone_name)
+    if action == "create":
+        return create_calendar_event(spec, timezone_name)
+
+    return "Не понял команду календаря. Скажи, например: что у меня завтра?"
+
+
 def is_web_search_intent(text: str) -> bool:
     low = normalize_text(text).lower()
     triggers = (
@@ -501,8 +729,25 @@ def health():
             "groq_configured": bool(GROQ_API_KEY),
             "model": MODEL,
             "memory_backend": "yandex-state",
+            "calendar_configured": calendar_configured(),
         }
     )
+
+
+@app.get("/calendar")
+def calendar_test():
+    text = request.args.get("q", "").strip()
+    timezone_name = request.args.get("tz", "Europe/Moscow").strip() or "Europe/Moscow"
+    if not text:
+        return jsonify({"error": "Use ?q=calendar command"}), 400
+    try:
+        answer = call_calendar_agent(text, timezone_name)
+        return jsonify({"request": text, "answer": answer})
+    except requests.Timeout:
+        return jsonify({"error": "Calendar timeout"}), 504
+    except Exception as exc:
+        print(f"Calendar error: {type(exc).__name__}: {exc}", flush=True)
+        return jsonify({"error": "Calendar request failed"}), 500
 
 
 @app.get("/search")
@@ -688,8 +933,12 @@ def alice():
         )
 
     try:
+        timezone_name = data.get("meta", {}).get("timezone") or "Europe/Moscow"
+
         if is_vkusvill_intent(command_for_memory):
             answer = call_vkusvill_agent(command_for_memory)
+        elif is_calendar_intent(command_for_memory):
+            answer = call_calendar_agent(command_for_memory, timezone_name)
         elif is_web_search_intent(command_for_memory):
             answer = call_web_agent(command_for_memory, history, memory)
         else:
