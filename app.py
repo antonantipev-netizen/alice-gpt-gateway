@@ -6,6 +6,7 @@ from threading import Lock, Thread
 
 import requests
 from flask import Flask, jsonify, request
+from vkusvill_direct import build_cart_direct_sync
 
 app = Flask(__name__)
 
@@ -897,6 +898,18 @@ def search_web():
         return jsonify({"error": "Web search timeout"}), 504
     except Exception as exc:
         print(f"Web search error: {exc}", flush=True)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/vkusvill-direct")
+def vkusvill_direct():
+    text = request.args.get("q", "").strip()
+    if not text:
+        return jsonify({"error": "Use ?q=what to buy"}), 400
+    try:
+        return jsonify(build_cart_direct_sync(text))
+    except Exception as exc:
+        print(f"VkusVill direct error: {exc}", flush=True)
         return jsonify({"error": str(exc)}), 500
 
 
