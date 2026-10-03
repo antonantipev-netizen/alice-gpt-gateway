@@ -18,6 +18,12 @@ GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
+BITRIX_TASKS_WEBHOOK_URL = (
+    os.getenv("BITRIX_TASKS_WEBHOOK_URL")
+    or os.getenv("BITRIX_WEBHOOK_URL")
+    or ""
+).strip()
+BITRIX_REQUEST_TAG = os.getenv("BITRIX_REQUEST_TAG", "SMR_Request").strip()
 
 WORK_CONTEXT_PATH = Path(os.getenv("WORK_CONTEXT_PATH", "work_context.json"))
 
@@ -307,6 +313,213 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
     answer = response.json()["choices"][0]["message"]["content"]
     return clean_for_voice(answer)
 
+
+
+BITRIX_STATUS_LABELS = {
+    "1": "Новая",
+    "2": "Ожидает выполнения",
+    "3": "Выполняется",
+    "4": "Ждёт контроля",
+    "5": "Завершена",
+    "6": "Отложена",
+    "7": "Отклонена",
+}
+
+
+def bitrix_configured() -> bool:
+    return bool(BITRIX_TASKS_WEBHOOK_URL)
+
+
+def bitrix_base_url() -> str:
+    base = BITRIX_TASKS_WEBHOOK_URL.rstrip("/") + "/"
+    if not re.match(r"^https://[^/]+/rest/\d+/[^/]+/$", base):
+        raise RuntimeError("BITRIX_URL_FORMAT")
+    return base
+
+
+def bitrix_api(method: str, params: dict | None = None) -> dict:
+    allowed = {"tasks.task.list", "tasks.task.get"}
+    if method not in allowed:
+        raise RuntimeError("BITRIX_METHOD_FORBIDDEN")
+    if not bitrix_configured():
+        raise RuntimeError("BITRIX_NOT_CONFIGURED")
+
+    url = bitrix_base_url() + method + ".json"
+    response = requests.post(
+        url,
+        json=params or {},
+        headers={"Content-Type": "application/json"},
+        timeout=4.0,
+        allow_redirects=False,
+    )
+
+    if 300 <= response.status_code < 400:
+        location = response.headers.get("Location")
+        if not location or not location.startswith(bitrix_base_url().split("/rest/")[0]):
+            raise RuntimeError("BITRIX_REDIRECT_FORBIDDEN")
+        response = requests.post(
+            location,
+            json=params or {},
+            headers={"Content-Type": "application/json"},
+            timeout=4.0,
+            allow_redirects=False,
+        )
+
+    if not response.ok:
+        raise RuntimeError(f"BITRIX_HTTP_{response.status_code}")
+
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(f"BITRIX_{payload.get('error')}")
+    return payload
+
+
+def clean_bitrix_description(value: str) -> str:
+    text = value or ""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</(?:p|div|li)>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\[/?(?:B|I|U|LIST|\*|QUOTE)(?:=[^\]]*)?\]", "", text, flags=re.I)
+    text = re.sub(r"\[URL=[^\]]+\]([^]*?)\[/URL\]", r"\1", text, flags=re.I)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    return normalize_text(text)[:700]
+
+
+def normalize_bitrix_task(task: dict) -> dict:
+    status = str(task.get("status") or task.get("STATUS") or "")
+    tags = task.get("tags") or task.get("TAGS") or []
+    if isinstance(tags, dict):
+        tags = list(tags.values())
+    clean_tags = []
+    for item in tags or []:
+        if isinstance(item, str):
+            clean_tags.append(item)
+        elif isinstance(item, dict):
+            clean_tags.append(item.get("title") or item.get("name") or "")
+
+    return {
+        "id": int(task.get("id") or task.get("ID") or 0),
+        "title": normalize_text(str(task.get("title") or task.get("TITLE") or ""))[:220],
+        "description": clean_bitrix_description(str(task.get("description") or task.get("DESCRIPTION") or "")),
+        "group_id": task.get("groupId") or task.get("GROUP_ID"),
+        "responsible_id": task.get("responsibleId") or task.get("RESPONSIBLE_ID"),
+        "created_date": task.get("createdDate") or task.get("CREATED_DATE"),
+        "changed_date": task.get("changedDate") or task.get("CHANGED_DATE"),
+        "deadline": task.get("deadline") or task.get("DEADLINE"),
+        "status": status,
+        "status_label": BITRIX_STATUS_LABELS.get(status, status or "—"),
+        "tags": [x for x in clean_tags if x],
+    }
+
+
+def get_bitrix_requests(limit: int = 50) -> list[dict]:
+    limit = max(1, min(limit, 100))
+    select = [
+        "ID", "TITLE", "DESCRIPTION", "GROUP_ID", "TAGS",
+        "CREATED_BY", "RESPONSIBLE_ID", "CREATED_DATE",
+        "CHANGED_DATE", "DEADLINE", "STATUS",
+    ]
+    tasks = []
+    start = 0
+
+    while len(tasks) < limit:
+        payload = bitrix_api(
+            "tasks.task.list",
+            {
+                "filter": {"TAG": BITRIX_REQUEST_TAG},
+                "order": {"CHANGED_DATE": "desc", "ID": "desc"},
+                "select": select,
+                "start": start,
+            },
+        )
+        result = payload.get("result") or {}
+        page = result.get("tasks") or []
+        if not isinstance(page, list):
+            raise RuntimeError("BITRIX_TASK_LIST_FORMAT")
+
+        tasks.extend(normalize_bitrix_task(task) for task in page)
+        next_start = payload.get("next")
+        if next_start is None:
+            next_start = result.get("next")
+        if next_start is None or len(tasks) >= limit:
+            break
+        start = int(next_start)
+
+    return tasks[:limit]
+
+
+def is_bitrix_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    triggers = (
+        "битрикс", "bitrix", "заявк", "задач смр",
+        "просроч", "приостановлен", "отложен",
+        "что в работе", "что назначено", "что закрыто",
+        "какие заявки", "активные заявки", "заявки на сегодня",
+    )
+    return any(trigger in low for trigger in triggers)
+
+
+def call_bitrix_agent(user_text: str, history: list[dict]) -> str:
+    if not bitrix_configured():
+        return (
+            "Bitrix24 ещё не подключён к Джарвису. "
+            "Нужно один раз добавить входящий webhook в Render."
+        )
+
+    tasks = get_bitrix_requests(50)
+    if not tasks:
+        return "В Bitrix24 не нашёл заявок с тегом SMR Request."
+
+    history_text = []
+    for item in trim_history(history):
+        role = "Антон" if item.get("role") == "user" else "Джарвис"
+        history_text.append(f"{role}: {item.get('content', '')}")
+
+    prompt = (
+        "Ты Джарвис, рабочий голосовой ассистент Антона. "
+        "Ниже живые данные заявок СМР из Bitrix24. "
+        "Отвечай ТОЛЬКО по этим данным. Не выдумывай статусы, сроки и объёмы. "
+        "Если нужной заявки нет среди переданных данных, так и скажи. "
+        "Статусы Bitrix: 1 новая, 2 ожидает выполнения, 3 выполняется, "
+        "4 ждёт контроля, 5 завершена, 6 отложена, 7 отклонена. "
+        "Ответ должен быть коротким и удобным для озвучивания: 2-5 предложений. "
+        "Если перечисляешь заявки, называй сначала объект/название и статус.\n\n"
+        "ЖИВЫЕ ЗАЯВКИ BITRIX24:\n"
+        + json.dumps(tasks, ensure_ascii=False)
+        + "\n\n"
+    )
+    if history_text:
+        prompt += "КОНТЕКСТ ДИАЛОГА:\n" + " | ".join(history_text) + "\n\n"
+    prompt += "ВОПРОС АНТОНА:\n" + user_text
+
+    response = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты анализируешь только переданные живые данные Bitrix24.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.15,
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+            "max_completion_tokens": 280,
+        },
+        timeout=3.0,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Bitrix agent {response.status_code}: {response.text[:500]}")
+
+    answer = response.json()["choices"][0]["message"]["content"]
+    return clean_for_voice(answer)
 
 
 def load_work_context() -> dict:
@@ -636,8 +849,24 @@ def health():
             "model": MODEL,
             "memory_backend": "yandex-state",
             "work_context_loaded": bool(load_work_context()),
+            "bitrix_configured": bitrix_configured(),
         }
     )
+
+
+@app.get("/bitrix")
+def bitrix_test():
+    text = request.args.get("q", "").strip()
+    if not text:
+        return jsonify({"error": "Use ?q=Bitrix question"}), 400
+    try:
+        answer = call_bitrix_agent(text, [])
+        return jsonify({"request": text, "answer": answer})
+    except requests.Timeout:
+        return jsonify({"error": "Bitrix timeout"}), 504
+    except Exception as exc:
+        print(f"Bitrix error: {type(exc).__name__}: {exc}", flush=True)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.get("/work")
@@ -856,6 +1085,8 @@ def alice():
                 "Принял. Собираю корзину ВкусВилла. "
                 "Потом скажи: Джарвис, корзина готова?"
             )
+        elif is_bitrix_intent(command_for_memory):
+            answer = call_bitrix_agent(command_for_memory, history)
         elif is_work_intent(command_for_memory):
             answer = call_work_agent(command_for_memory, history)
         elif is_web_search_intent(command_for_memory):
