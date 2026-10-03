@@ -474,7 +474,7 @@ def call_vkusvill_agent(user_text: str) -> str:
                 }
             ],
         },
-        timeout=18,
+        timeout=60,
     )
 
     if not response.ok:
