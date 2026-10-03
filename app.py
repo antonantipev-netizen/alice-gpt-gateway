@@ -7,7 +7,9 @@ app = Flask(__name__)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
 
 PERSONAL_PROFILE = (
     "Пользователя зовут Антон. Обращайся к нему на ты. "
@@ -210,6 +212,87 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
     return clean_for_voice(answer)
 
 
+
+def is_vkusvill_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    triggers = (
+        "вкусвилл", "вкус вилл", "корзин", "закажи продукт",
+        "купи продукт", "собери продукт", "закажи еду", "купи еду",
+        "продукты домой", "доставка продуктов",
+    )
+    return any(trigger in low for trigger in triggers)
+
+
+def extract_responses_text(payload: dict) -> str:
+    parts = []
+    for item in payload.get("output", []):
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and content.get("text"):
+                parts.append(content["text"])
+    return normalize_text(" ".join(parts))
+
+
+def call_vkusvill_agent(user_text: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    instructions = (
+        "Ты Джарвис, помощник Антона по покупкам во ВкусВилле. "
+        "Используй MCP ВкусВилла, чтобы найти подходящие товары и, когда запрос "
+        "достаточно конкретный, создать ссылку на корзину. "
+        "Не выдумывай товары, цены или наличие. "
+        "Если есть несколько вариантов, предпочитай популярный и хорошо оцененный товар, "
+        "если Антон не попросил дешевле, конкретный бренд, состав или КБЖУ. "
+        "Корзина может содержать максимум 20 позиций. "
+        "Не пытайся оформлять оплату: твоя задача — подготовить корзину и вернуть share_basket ссылку. "
+        "Ответ по-русски, коротко. Если корзина создана, обязательно верни полную ссылку."
+    )
+
+    response = requests.post(
+        GROQ_RESPONSES_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "instructions": instructions,
+            "input": user_text,
+            "tools": [
+                {
+                    "type": "mcp",
+                    "server_label": "vkusvill",
+                    "server_url": VKUSVILL_MCP_URL,
+                    "server_description": (
+                        "Официальный MCP ВкусВилла: поиск товаров, детали товара "
+                        "и создание ссылки на корзину."
+                    ),
+                    "require_approval": "never",
+                    "allowed_tools": [
+                        "vkusvill_products_search",
+                        "vkusvill_product_details",
+                        "vkusvill_cart_link_create",
+                    ],
+                }
+            ],
+        },
+        timeout=18,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Groq Responses {response.status_code}: {response.text[:700]}"
+        )
+
+    answer = extract_responses_text(response.json())
+    if not answer:
+        raise RuntimeError("Groq Responses returned no final assistant text")
+
+    return answer
+
+
 def make_alice_response(
     version: str,
     session: dict,
@@ -218,13 +301,14 @@ def make_alice_response(
     memory: str,
     end_session: bool = False,
     clear_memory: bool = False,
+    tts_answer: str | None = None,
 ) -> dict:
     result = {
         "version": version,
         "session": session,
         "response": {
             "text": answer,
-            "tts": answer,
+            "tts": tts_answer or answer,
             "end_session": end_session,
         },
         "session_state": {
@@ -271,6 +355,22 @@ def health():
             "memory_backend": "yandex-state",
         }
     )
+
+
+@app.get("/vkusvill")
+def vkusvill():
+    text = request.args.get("q", "").strip()
+    if not text:
+        return jsonify({"error": "Use ?q=what to buy"}), 400
+
+    try:
+        answer = call_vkusvill_agent(text)
+        return jsonify({"request": text, "answer": answer})
+    except requests.Timeout:
+        return jsonify({"error": "VkusVill agent timeout"}), 504
+    except Exception as exc:
+        print(f"VkusVill error: {exc}", flush=True)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.get("/ask")
@@ -401,7 +501,11 @@ def alice():
         )
 
     try:
-        answer = call_groq(command_for_memory, history, memory)
+        if is_vkusvill_intent(command_for_memory):
+            answer = call_vkusvill_agent(command_for_memory)
+        else:
+            answer = call_groq(command_for_memory, history, memory)
+
         history = history + [
             {"role": "user", "content": command_for_memory},
             {"role": "assistant", "content": answer},
@@ -412,6 +516,13 @@ def alice():
         print(f"AI error: {exc}", flush=True)
         answer = "Сейчас не получилось связаться с ИИ. Попробуй ещё раз."
 
+    tts_answer = None
+    if is_vkusvill_intent(command_for_memory) and "http" in answer:
+        tts_answer = (
+            "Готово. Я собрал корзину ВкусВилла. "
+            "Ссылка есть в текстовом ответе."
+        )
+
     return jsonify(
         make_alice_response(
             version,
@@ -419,6 +530,7 @@ def alice():
             answer,
             history,
             memory,
+            tts_answer=tts_answer,
         )
     )
 
