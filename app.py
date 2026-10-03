@@ -1,5 +1,7 @@
 import os
 import re
+import json
+from pathlib import Path
 from threading import Lock, Thread
 
 import requests
@@ -16,6 +18,8 @@ GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
+
+WORK_CONTEXT_PATH = Path(os.getenv("WORK_CONTEXT_PATH", "work_context.json"))
 
 
 PERSONAL_PROFILE = (
@@ -305,6 +309,88 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
 
 
 
+def load_work_context() -> dict:
+    try:
+        with WORK_CONTEXT_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        print(f"Work context load error: {exc}", flush=True)
+        return {}
+
+
+def is_work_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    triggers = (
+        "что у нас по", "что по объекту", "по геленджику", "по кск",
+        "по планетарию", "по шепелюгинской", "по залу министра",
+        "по сколково", "по смр", "монтажники", "бригада", "инженер пнр",
+        "план смр", "отчет по объекту", "отчёт по объекту",
+        "какие объекты", "статус объекта", "рабочий контекст",
+        "что мы решили", "что осталось сделать"
+    )
+    return any(trigger in low for trigger in triggers)
+
+
+def call_work_agent(user_text: str, history: list[dict]) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    context = load_work_context()
+    if not context:
+        return "Рабочая база пока недоступна."
+
+    history_text = []
+    for item in trim_history(history):
+        role = "Антон" if item.get("role") == "user" else "Джарвис"
+        history_text.append(f"{role}: {item.get('content', '')}")
+
+    prompt = (
+        "Ты Джарвис, рабочий ассистент Антона. "
+        "Отвечай только на основании рабочей базы ниже. "
+        "Если нужного факта в базе нет, прямо скажи, что в текущей рабочей базе этого нет. "
+        "Не выдумывай даты, статусы, людей или объёмы. "
+        "Для голосового ответа используй 2-5 коротких предложений, без markdown. "
+        "Если вопрос про статус объекта, сначала дай текущий статус, затем главное ожидание или следующий шаг.\n\n"
+        "РАБОЧАЯ БАЗА:\n"
+        + json.dumps(context, ensure_ascii=False)
+        + "\n\n"
+    )
+
+    if history_text:
+        prompt += "КОНТЕКСТ ДИАЛОГА:\n" + " | ".join(history_text) + "\n\n"
+
+    prompt += "ВОПРОС АНТОНА:\n" + user_text
+
+    response = requests.post(
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты аккуратный рабочий ассистент. Не добавляй факты, которых нет в переданном контексте.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+            "max_completion_tokens": 260,
+        },
+        timeout=3.2,
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"Work agent {response.status_code}: {response.text[:500]}")
+
+    answer = response.json()["choices"][0]["message"]["content"]
+    return clean_for_voice(answer)
+
+
 def is_web_search_intent(text: str) -> bool:
     low = normalize_text(text).lower()
     triggers = (
@@ -549,8 +635,24 @@ def health():
             "groq_configured": bool(GROQ_API_KEY),
             "model": MODEL,
             "memory_backend": "yandex-state",
+            "work_context_loaded": bool(load_work_context()),
         }
     )
+
+
+@app.get("/work")
+def work_test():
+    text = request.args.get("q", "").strip()
+    if not text:
+        return jsonify({"error": "Use ?q=work question"}), 400
+    try:
+        answer = call_work_agent(text, [])
+        return jsonify({"request": text, "answer": answer})
+    except requests.Timeout:
+        return jsonify({"error": "Work agent timeout"}), 504
+    except Exception as exc:
+        print(f"Work agent error: {exc}", flush=True)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.get("/search")
@@ -754,6 +856,8 @@ def alice():
                 "Принял. Собираю корзину ВкусВилла. "
                 "Потом скажи: Джарвис, корзина готова?"
             )
+        elif is_work_intent(command_for_memory):
+            answer = call_work_agent(command_for_memory, history)
         elif is_web_search_intent(command_for_memory):
             answer = call_web_agent(command_for_memory, history, memory)
         else:
