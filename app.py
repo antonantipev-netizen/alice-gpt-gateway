@@ -9,6 +9,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
 
 PERSONAL_PROFILE = (
@@ -298,6 +299,68 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
 
 
 
+def is_web_search_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    triggers = (
+        "найди в интернете", "поищи в интернете", "проверь в интернете",
+        "посмотри в интернете", "найди в сети", "поищи в сети",
+        "что нового", "последние новости", "свежие новости",
+        "сегодня произошло", "что сейчас", "актуальная информация",
+        "актуальные данные", "последние данные", "текущий курс",
+        "курс доллара", "курс евро", "погода сейчас", "погода сегодня",
+        "прогноз погоды", "кто сейчас", "когда сегодня",
+    )
+    return any(trigger in low for trigger in triggers)
+
+
+def call_web_agent(user_text: str, history: list[dict], memory: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    context = []
+    for item in trim_history(history):
+        role = "Антон" if item.get("role") == "user" else "Джарвис"
+        context.append(f"{role}: {item.get('content', '')}")
+
+    prompt = (
+        "Ты Джарвис, голосовой ассистент Антона. "
+        "Найди актуальную информацию в интернете с помощью browser_search. "
+        "Отвечай по-русски, коротко и конкретно, обычно 2-4 предложения. "
+        "Не проговаривай длинные URL. Не выдумывай факты. "
+    )
+    if memory:
+        prompt += f"Уместная память об Антоне: {memory}. "
+    if context:
+        prompt += "Контекст текущего разговора: " + " | ".join(context) + ". "
+    prompt += "Запрос Антона: " + user_text
+
+    response = requests.post(
+        GROQ_RESPONSES_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": SEARCH_MODEL,
+            "input": prompt,
+            "tools": [{"type": "browser_search"}],
+            "tool_choice": "required",
+        },
+        timeout=8,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Groq browser search {response.status_code}: {response.text[:700]}"
+        )
+
+    answer = extract_responses_text(response.json())
+    if not answer:
+        raise RuntimeError("Groq browser search returned no final assistant text")
+
+    return clean_for_voice(answer)
+
+
 def is_vkusvill_intent(text: str) -> bool:
     low = normalize_text(text).lower()
     triggers = (
@@ -440,6 +503,22 @@ def health():
             "memory_backend": "yandex-state",
         }
     )
+
+
+@app.get("/search")
+def search_web():
+    text = request.args.get("q", "").strip()
+    if not text:
+        return jsonify({"error": "Use ?q=what to search"}), 400
+
+    try:
+        answer = call_web_agent(text, [], "")
+        return jsonify({"request": text, "answer": answer})
+    except requests.Timeout:
+        return jsonify({"error": "Web search timeout"}), 504
+    except Exception as exc:
+        print(f"Web search error: {exc}", flush=True)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.get("/vkusvill")
@@ -611,6 +690,8 @@ def alice():
     try:
         if is_vkusvill_intent(command_for_memory):
             answer = call_vkusvill_agent(command_for_memory)
+        elif is_web_search_intent(command_for_memory):
+            answer = call_web_agent(command_for_memory, history, memory)
         else:
             answer = call_groq(command_for_memory, history, memory)
 
