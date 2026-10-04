@@ -90,6 +90,8 @@ VKUSVILL_OAUTH_TOKEN_PATH = Path(
 VKUSVILL_OAUTH_STATE_MAX_AGE = 15 * 60
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 VKUSVILL_OAUTH_REDIS_KEY = "jarvis:vkusvill:oauth_tokens"
+CHECKOUT_WORKER_TOKEN = os.getenv("CHECKOUT_WORKER_TOKEN", "").strip()
+VKUSVILL_CHECKOUT_QUEUE_KEY = "jarvis:vkusvill:checkout:queue"
 
 WORK_CONTEXT_PATH = Path(os.getenv("WORK_CONTEXT_PATH", "work_context.json"))
 
@@ -1171,6 +1173,124 @@ def get_vkusvill_job(job_key: str) -> dict:
         return dict(VKUSVILL_JOBS.get(job_key, {}))
 
 
+def is_vkusvill_checkout_prepare_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    phrases = (
+        "оформи заказ", "оформляй заказ", "перейди к оформлению",
+        "подготовь оформление", "подготовь заказ", "оформить заказ",
+    )
+    return any(phrase in low for phrase in phrases)
+
+
+def is_vkusvill_checkout_status_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    phrases = (
+        "что с заказом", "что с оформлением", "статус заказа",
+        "статус оформления", "оформление готово", "заказ готов",
+    )
+    return any(phrase in low for phrase in phrases)
+
+
+def _checkout_task_key(task_id: str) -> str:
+    return f"jarvis:vkusvill:checkout:task:{task_id}"
+
+
+def _checkout_user_task_key(job_key: str) -> str:
+    digest = hashlib.sha256(job_key.encode("utf-8")).hexdigest()
+    return f"jarvis:vkusvill:checkout:user:{digest}"
+
+
+def _save_checkout_task(task: dict) -> None:
+    client = _get_redis_client()
+    if client is None:
+        raise RuntimeError("redis_unavailable")
+    task_id = str(task.get("task_id") or "")
+    if not task_id:
+        raise ValueError("missing_task_id")
+    client.setex(
+        _checkout_task_key(task_id),
+        24 * 60 * 60,
+        json.dumps(task, ensure_ascii=False),
+    )
+
+
+def _create_checkout_task(job_key: str, cart: dict) -> dict:
+    cart_url = str(cart.get("cart_url") or "")
+    items = cart.get("items") if isinstance(cart, dict) else None
+    if not cart_url or not isinstance(items, list) or not items:
+        raise ValueError("no_active_cart")
+
+    client = _get_redis_client()
+    if client is None:
+        raise RuntimeError("redis_unavailable")
+
+    task_id = secrets.token_urlsafe(18)
+    task = {
+        "task_id": task_id,
+        "status": "queued",
+        "mode": "inspect",
+        "cart_url": cart_url,
+        "item_count": len(items),
+        "created_at": int(time.time()),
+        "updated_at": int(time.time()),
+    }
+    _save_checkout_task(task)
+    client.setex(
+        _checkout_user_task_key(job_key),
+        24 * 60 * 60,
+        task_id,
+    )
+    client.rpush(VKUSVILL_CHECKOUT_QUEUE_KEY, task_id)
+    return task
+
+
+def _get_checkout_task_for_user(job_key: str) -> dict:
+    client = _get_redis_client()
+    if client is None:
+        return {}
+    try:
+        task_id = client.get(_checkout_user_task_key(job_key))
+        if not task_id:
+            return {}
+        raw = client.get(_checkout_task_key(task_id))
+        if not raw:
+            return {}
+        task = json.loads(raw)
+        return task if isinstance(task, dict) else {}
+    except Exception as exc:
+        print(f"Checkout task load failed: {type(exc).__name__}", flush=True)
+        return {}
+
+
+def _describe_checkout_task(task: dict) -> str:
+    status = str(task.get("status") or "")
+    if status in {"queued", "leased", "working"}:
+        return "Задание на оформление передано на Synology. Браузер готовит страницу ВкусВилла."
+    if status == "needs_login":
+        return "Synology открыл ВкусВилл, но нужно один раз войти в аккаунт."
+    if status == "inspected":
+        return (
+            "Synology открыл корзину ВкусВилла и проверил страницу. "
+            "Покупка ещё не подтверждалась и заказ не оформлялся."
+        )
+    if status == "ready_for_confirmation":
+        return "Оформление подготовлено и ждёт твоего подтверждения."
+    if status == "completed":
+        return "Заказ оформлен."
+    if status == "error":
+        message = str(task.get("message") or "").strip()
+        return "Не получилось подготовить оформление." + (f" {message}" if message else "")
+    return "Пока нет активного задания на оформление."
+
+
+def _worker_is_authorized() -> bool:
+    if not CHECKOUT_WORKER_TOKEN:
+        return False
+    supplied = request.headers.get("Authorization", "")
+    expected = "Bearer " + CHECKOUT_WORKER_TOKEN
+    return hmac.compare_digest(supplied, expected)
+
+
 def extract_responses_text(payload: dict) -> str:
     parts = []
     for item in payload.get("output", []):
@@ -1675,6 +1795,109 @@ def vkusvill():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/vkusvill/checkout/worker/next")
+def vkusvill_checkout_worker_next():
+    if not CHECKOUT_WORKER_TOKEN:
+        return jsonify({"error": "checkout_worker_not_configured"}), 503
+    if not _worker_is_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    client = _get_redis_client()
+    if client is None:
+        return jsonify({"error": "redis_unavailable"}), 503
+
+    for _ in range(10):
+        task_id = client.lpop(VKUSVILL_CHECKOUT_QUEUE_KEY)
+        if not task_id:
+            return ("", 204)
+        raw = client.get(_checkout_task_key(task_id))
+        if not raw:
+            continue
+        try:
+            task = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(task, dict) or task.get("status") != "queued":
+            continue
+
+        task["status"] = "leased"
+        task["leased_at"] = int(time.time())
+        task["updated_at"] = int(time.time())
+        _save_checkout_task(task)
+        return jsonify({
+            "task_id": task.get("task_id"),
+            "mode": task.get("mode"),
+            "cart_url": task.get("cart_url"),
+            "item_count": task.get("item_count"),
+        })
+
+    return ("", 204)
+
+
+@app.post("/vkusvill/checkout/worker/report")
+def vkusvill_checkout_worker_report():
+    if not CHECKOUT_WORKER_TOKEN:
+        return jsonify({"error": "checkout_worker_not_configured"}), 503
+    if not _worker_is_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    task_id = str(data.get("task_id") or "").strip()
+    status = str(data.get("status") or "").strip()
+    allowed_statuses = {
+        "working", "needs_login", "inspected",
+        "ready_for_confirmation", "completed", "error",
+    }
+    if not task_id or status not in allowed_statuses:
+        return jsonify({"error": "invalid_report"}), 400
+
+    client = _get_redis_client()
+    if client is None:
+        return jsonify({"error": "redis_unavailable"}), 503
+
+    raw = client.get(_checkout_task_key(task_id))
+    if not raw:
+        return jsonify({"error": "task_not_found"}), 404
+
+    try:
+        task = json.loads(raw)
+    except Exception:
+        return jsonify({"error": "task_corrupt"}), 500
+
+    task["status"] = status
+    task["updated_at"] = int(time.time())
+
+    message = normalize_text(str(data.get("message") or ""))[:300]
+    if message:
+        task["message"] = message
+
+    diagnostics = data.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        safe = {
+            "title": normalize_text(str(diagnostics.get("title") or ""))[:160],
+            "url": str(diagnostics.get("url") or "")[:500],
+            "buttons": [
+                normalize_text(str(x))[:120]
+                for x in (diagnostics.get("buttons") or [])[:30]
+                if str(x).strip()
+            ],
+            "links": [
+                normalize_text(str(x))[:120]
+                for x in (diagnostics.get("links") or [])[:30]
+                if str(x).strip()
+            ],
+            "inputs": [
+                normalize_text(str(x))[:120]
+                for x in (diagnostics.get("inputs") or [])[:20]
+                if str(x).strip()
+            ],
+        }
+        task["diagnostics"] = safe
+
+    _save_checkout_task(task)
+    return jsonify({"ok": True, "status": status})
+
+
 @app.get("/ask")
 def ask():
     text = request.args.get("text", "").strip()
@@ -1859,7 +2082,26 @@ def alice():
             )
         )
 
-        if is_vkusvill_cart_show_intent(command_for_memory):
+        if is_vkusvill_checkout_status_intent(command_for_memory):
+            answer = _describe_checkout_task(
+                _get_checkout_task_for_user(vkusvill_job_key)
+            )
+        elif is_vkusvill_checkout_prepare_intent(command_for_memory):
+            if not active_cart.get("items") or not active_cart.get("cart_url"):
+                answer = "Сначала собери корзину ВкусВилла."
+            elif not CHECKOUT_WORKER_TOKEN:
+                answer = (
+                    "Checkout worker пока не подключён. "
+                    "Корзина готова, но Synology ещё не настроен."
+                )
+            else:
+                task = _create_checkout_task(vkusvill_job_key, active_cart)
+                answer = (
+                    "Передал корзину на Synology. "
+                    "Сейчас браузер откроет ВкусВилл и подготовит оформление, "
+                    "но заказ не подтвердит."
+                )
+        elif is_vkusvill_cart_show_intent(command_for_memory):
             answer = _describe_vkusvill_active_cart(active_cart)
         elif edit_is_contextual:
             start_vkusvill_cart_edit_job(vkusvill_job_key, cart_edit)
