@@ -143,10 +143,40 @@ def _choose_product(query: str, items: list[dict]) -> dict | None:
 def _compact_history_context(payload: Any) -> str:
     if payload in (None, {}, [], ""):
         return ""
+
+    blocked_fragments = (
+        "id", "number", "phone", "email", "address", "token",
+        "payment", "card", "user", "customer",
+    )
+
+    def sanitize(value: Any, depth: int = 0) -> Any:
+        if depth > 5:
+            return None
+        if isinstance(value, list):
+            return [sanitize(item, depth + 1) for item in value[:20]]
+        if isinstance(value, dict):
+            result = {}
+            for key, item in list(value.items())[:40]:
+                key_text = str(key).lower()
+                if any(fragment in key_text for fragment in blocked_fragments):
+                    continue
+                cleaned = sanitize(item, depth + 1)
+                if cleaned not in (None, {}, [], ""):
+                    result[str(key)] = cleaned
+            return result
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        return None
+
     try:
-        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        safe_payload = sanitize(payload)
+        raw = json.dumps(
+            safe_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
     except Exception:
-        raw = str(payload)
+        return ""
     return raw[:6000]
 
 
