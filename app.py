@@ -38,7 +38,9 @@ def _startup_vkusvill_auth_check():
             print(
                 "VKOAUTH_CART_SMOKE "
                 f"success={bool(cart.get('success'))} "
-                f"items={len(cart.get('selected', []))}",
+                f"items={len(cart.get('selected', []))} "
+                f"ai_selected={cart.get('ai_selected')} "
+                f"history_context_used={bool(cart.get('history_context_used'))}",
                 flush=True,
             )
 
@@ -975,6 +977,8 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 print(
                     f"VkusVill direct success: items={len(names)} "
                     f"authenticated={bool(access_token)} "
+                    f"ai_selected={direct.get('ai_selected')} "
+                    f"history_context_used={bool(direct.get('history_context_used'))} "
                     f"url_present={bool(direct.get('cart_url'))}",
                     flush=True,
                 )
