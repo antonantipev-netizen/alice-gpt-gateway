@@ -947,9 +947,23 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 access_token=access_token or None,
             )
             if direct.get("success") and direct.get("cart_url"):
+                items = []
+                for selected_item in direct.get("selected", []):
+                    item = dict(selected_item)
+                    item["quantity"] = 1
+                    items.append(item)
+
+                _save_vkusvill_active_cart(
+                    job_key,
+                    {
+                        "items": items,
+                        "cart_url": direct.get("cart_url"),
+                    },
+                )
+
                 names = [
                     item.get("name")
-                    for item in direct.get("selected", [])
+                    for item in items
                     if item.get("name")
                 ]
                 summary = ", ".join(names[:6])
@@ -961,7 +975,7 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 print(
                     f"VkusVill direct success: items={len(names)} "
                     f"authenticated={bool(access_token)} "
-                    f"url={direct['cart_url']}",
+                    f"url_present={bool(direct.get('cart_url'))}",
                     flush=True,
                 )
             else:
@@ -981,6 +995,157 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
             payload = {"status": "error", "error": type(exc).__name__}
 
         _save_vkusvill_job(job_key, payload)
+
+    _save_vkusvill_job(job_key, {"status": "working"})
+    Thread(target=worker, daemon=True).start()
+
+
+def start_vkusvill_cart_edit_job(job_key: str, edit: dict) -> None:
+    def worker():
+        try:
+            action = edit.get("action")
+            cart = _load_vkusvill_active_cart(job_key)
+            items = list(cart.get("items") or [])
+
+            if action == "clear":
+                _clear_vkusvill_active_cart(job_key)
+                _save_vkusvill_job(
+                    job_key,
+                    {"status": "done", "result": "Корзину ВкусВилла очистил."},
+                )
+                return
+
+            if not items and action != "add":
+                _save_vkusvill_job(
+                    job_key,
+                    {
+                        "status": "error",
+                        "error": "no_active_cart",
+                        "result": "Сначала создай корзину ВкусВилла.",
+                    },
+                )
+                return
+
+            oauth_tokens = _load_vkusvill_tokens()
+            access_token = str(oauth_tokens.get("access_token") or "")
+
+            if action == "add":
+                queries = edit.get("queries") or []
+                resolved = resolve_product_queries_sync(
+                    queries,
+                    access_token=access_token or None,
+                )
+                for new_item in resolved.get("selected", []):
+                    _merge_cart_item(items, new_item, 1)
+                if not resolved.get("selected"):
+                    raise ValueError("product_not_found")
+
+            elif action == "remove":
+                targets = edit.get("queries") or []
+                before = len(items)
+                items = [
+                    item for item in items
+                    if not any(_cart_item_matches(item, target) for target in targets)
+                ]
+                if len(items) == before:
+                    raise ValueError("cart_item_not_found")
+
+            elif action == "replace":
+                old_query = str(edit.get("old") or "")
+                new_query = str(edit.get("new") or "")
+                matched = [
+                    item for item in items
+                    if _cart_item_matches(item, old_query)
+                ]
+                if not matched:
+                    raise ValueError("cart_item_not_found")
+                replacement_quantity = int(matched[0].get("quantity") or 1)
+                items = [
+                    item for item in items
+                    if not _cart_item_matches(item, old_query)
+                ]
+                resolved = resolve_product_queries_sync(
+                    [new_query],
+                    access_token=access_token or None,
+                )
+                selected = resolved.get("selected") or []
+                if not selected:
+                    raise ValueError("replacement_not_found")
+                _merge_cart_item(items, selected[0], replacement_quantity)
+
+            elif action == "set_quantity":
+                target = str(edit.get("query") or "")
+                quantity = int(edit.get("quantity") or 0)
+                found = False
+                updated_items = []
+                for item in items:
+                    if _cart_item_matches(item, target):
+                        found = True
+                        if quantity > 0:
+                            item = dict(item)
+                            item["quantity"] = quantity
+                            updated_items.append(item)
+                    else:
+                        updated_items.append(item)
+                if not found:
+                    raise ValueError("cart_item_not_found")
+                items = updated_items
+
+            if not items:
+                _clear_vkusvill_active_cart(job_key)
+                _save_vkusvill_job(
+                    job_key,
+                    {"status": "done", "result": "Корзина ВкусВилла теперь пуста."},
+                )
+                return
+
+            link_result = create_cart_link_from_items_sync(
+                items,
+                access_token=access_token or None,
+            )
+            if not link_result.get("success") or not link_result.get("cart_url"):
+                raise RuntimeError("cart_link_not_created")
+
+            cart = {
+                "items": items,
+                "cart_url": link_result.get("cart_url"),
+            }
+            _save_vkusvill_active_cart(job_key, cart)
+            _save_vkusvill_job(
+                job_key,
+                {"status": "done", "result": _describe_vkusvill_active_cart(cart)},
+            )
+            print(
+                f"VkusVill active cart updated: action={action} "
+                f"items={len(items)} authenticated={bool(access_token)}",
+                flush=True,
+            )
+
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "cart_item_not_found":
+                message = "Не нашёл такой товар в активной корзине."
+            elif reason == "replacement_not_found":
+                message = "Не удалось найти подходящую замену."
+            else:
+                message = "Не удалось найти подходящий товар."
+            _save_vkusvill_job(
+                job_key,
+                {"status": "error", "error": reason, "result": message},
+            )
+        except Exception as exc:
+            print(
+                f"VkusVill active cart edit error: {type(exc).__name__}",
+                flush=True,
+            )
+            _save_vkusvill_job(
+                job_key,
+                {
+                    "status": "error",
+                    "error": type(exc).__name__,
+                    "result": "Не получилось обновить корзину.",
+                },
+            )
 
     _save_vkusvill_job(job_key, {"status": "working"})
     Thread(target=worker, daemon=True).start()
