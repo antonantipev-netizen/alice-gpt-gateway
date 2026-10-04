@@ -818,6 +818,108 @@ def _vkusvill_job_redis_key(job_key: str) -> str:
     return f"jarvis:vkusvill:job:{digest}"
 
 
+def _vkusvill_active_cart_redis_key(job_key: str) -> str:
+    digest = hashlib.sha256(job_key.encode("utf-8")).hexdigest()
+    return f"jarvis:vkusvill:active_cart:{digest}"
+
+
+def _save_vkusvill_active_cart(job_key: str, payload: dict) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        data = dict(payload)
+        data["updated_at"] = int(time.time())
+        client.setex(
+            _vkusvill_active_cart_redis_key(job_key),
+            7 * 24 * 60 * 60,
+            json.dumps(data, ensure_ascii=False),
+        )
+    except Exception as exc:
+        print(f"Redis active cart save failed: {type(exc).__name__}", flush=True)
+
+
+def _load_vkusvill_active_cart(job_key: str) -> dict:
+    client = _get_redis_client()
+    if client is None:
+        return {}
+    try:
+        raw = client.get(_vkusvill_active_cart_redis_key(job_key))
+        if raw:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:
+        print(f"Redis active cart load failed: {type(exc).__name__}", flush=True)
+    return {}
+
+
+def _clear_vkusvill_active_cart(job_key: str) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        client.delete(_vkusvill_active_cart_redis_key(job_key))
+    except Exception as exc:
+        print(f"Redis active cart clear failed: {type(exc).__name__}", flush=True)
+
+
+def _cart_item_matches(item: dict, query: str) -> bool:
+    target_tokens = [
+        token for token in re.findall(r"[а-яa-z0-9]+", query.lower())
+        if len(token) >= 3
+    ]
+    if not target_tokens:
+        return False
+    haystack = (
+        str(item.get("query") or "") + " " + str(item.get("name") or "")
+    ).lower()
+    return all(token[:4] in haystack for token in target_tokens)
+
+
+def _merge_cart_item(items: list[dict], new_item: dict, quantity: int = 1) -> None:
+    xml_id = new_item.get("xml_id")
+    for item in items:
+        if item.get("xml_id") == xml_id:
+            item["quantity"] = int(item.get("quantity") or 1) + quantity
+            return
+    value = dict(new_item)
+    value["quantity"] = quantity
+    items.append(value)
+
+
+def _describe_vkusvill_active_cart(cart: dict) -> str:
+    items = cart.get("items") if isinstance(cart, dict) else None
+    if not isinstance(items, list) or not items:
+        return "Активная корзина ВкусВилла пуста."
+
+    parts = []
+    total = 0.0
+    total_units = 0
+    for item in items[:10]:
+        quantity = int(item.get("quantity") or 1)
+        total_units += quantity
+        name = str(item.get("name") or item.get("query") or "товар")
+        parts.append(f"{name} ×{quantity}" if quantity != 1 else name)
+        try:
+            total += float(item.get("price") or 0) * quantity
+        except (TypeError, ValueError):
+            pass
+
+    text = "В корзине: " + ", ".join(parts)
+    if len(items) > 10:
+        text += f", и ещё {len(items) - 10} позиций"
+    text += f". Всего {total_units} товаров"
+    if total > 0:
+        text += f", примерно на {round(total)} рублей"
+    text += "."
+
+    cart_url = str(cart.get("cart_url") or "")
+    if cart_url:
+        text += " " + cart_url
+    return text
+
+
 def _save_vkusvill_job(job_key: str, payload: dict) -> None:
     client = _get_redis_client()
     if client is not None:
