@@ -28,6 +28,15 @@ def _startup_vkusvill_auth_check():
         if not access_token:
             print("VKOAUTH_ACCOUNT_CHECK connected=False", flush=True)
             return
+        if os.getenv("VKUSVILL_CART_SMOKE_ON_START", "0") == "1":
+            cart = build_cart_direct_sync("молоко", access_token=access_token)
+            print(
+                "VKOAUTH_CART_SMOKE "
+                f"success={bool(cart.get('success'))} "
+                f"items={len(cart.get('selected', []))}",
+                flush=True,
+            )
+
         result = check_authenticated_vkusvill_sync(access_token)
         print(
             "VKOAUTH_ACCOUNT_CHECK "
