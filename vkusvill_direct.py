@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import re
@@ -8,8 +9,7 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-MCP_URL = "https://mcp.vkusvill.ru/mcp"
-
+MCP_URL = "https://mcp.vkusvill.ru/mcp"\nGROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()\nGROQ_URL = "https://api.groq.com/openai/v1/chat/completions"\nGROQ_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-20b")\n
 
 def _extract_payload(tool_result: Any) -> Any:
     structured = getattr(tool_result, "structuredContent", None)
@@ -97,7 +97,7 @@ def parse_targets(text: str) -> list[str]:
     return result[:20]
 
 
-def _choose_product(query: str, items: list[dict]) -> dict | None:
+def _rank_product_candidates(query: str, items: list[dict]) -> list[dict]:
     q = query.lower().strip()
     tokens = [t for t in re.findall(r"[а-яa-z0-9]+", q) if len(t) >= 3]
 
@@ -119,26 +119,126 @@ def _choose_product(query: str, items: list[dict]) -> dict | None:
 
     ranked = []
     for item in items:
-        pid = _product_id(item)
-        if not pid:
+        if not _product_id(item):
             continue
         name = _name(item).lower()
         relevance = sum(2 for token in tokens if token[:5] in name)
-
         for bad in penalties.get(q, []):
             if bad in name:
                 relevance -= 4
-
         for good in boosts.get(q, []):
             if good in name:
                 relevance += 1
-
         ranked.append((relevance, _rating(item), -_price(item), item))
 
-    if not ranked:
-        return None
     ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    return ranked[0][3]
+    return [row[3] for row in ranked]
+
+
+def _choose_product(query: str, items: list[dict]) -> dict | None:
+    ranked = _rank_product_candidates(query, items)
+    return ranked[0] if ranked else None
+
+
+def _compact_history_context(payload: Any) -> str:
+    if payload in (None, {}, [], ""):
+        return ""
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        raw = str(payload)
+    return raw[:6000]
+
+
+async def _choose_product_with_ai(
+    query: str,
+    items: list[dict],
+    history_context: str = "",
+) -> tuple[dict | None, str]:
+    ranked = _rank_product_candidates(query, items)
+    if not ranked:
+        return None, "none"
+
+    shortlist = ranked[:8]
+    if not GROQ_API_KEY or len(shortlist) == 1:
+        return shortlist[0], "fallback"
+
+    candidates = []
+    for index, item in enumerate(shortlist):
+        candidates.append(
+            {
+                "index": index,
+                "xml_id": _product_id(item),
+                "name": _name(item),
+                "price": _price(item),
+                "rating": _rating(item),
+            }
+        )
+
+    system = (
+        "Ты выбираешь конкретный товар ВкусВилла для корзины пользователя. "
+        "Можно выбрать ТОЛЬКО один index из переданного списка candidates. "
+        "Не придумывай новые товары, бренды, цены или свойства. "
+        "Главный приоритет: точное соответствие запросу пользователя. "
+        "Если история заказов содержит явное совпадение или устойчивое предпочтение, "
+        "предпочитай привычный вариант. Затем учитывай релевантность названия, рейтинг "
+        "и разумную цену. Верни только JSON вида {\"index\": 0}."
+    )
+    user_payload = {
+        "query": query,
+        "candidates": candidates,
+        "recent_order_context": history_context or None,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": "Bearer " + GROQ_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                user_payload,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ],
+                },
+            )
+        response.raise_for_status()
+        answer = response.json()["choices"][0]["message"]["content"]
+        match = re.search(r"\{.*?\}", str(answer), flags=re.S)
+        if not match:
+            return shortlist[0], "fallback"
+        parsed = json.loads(match.group(0))
+        index = int(parsed.get("index"))
+        if 0 <= index < len(shortlist):
+            return shortlist[index], "ai"
+    except Exception as exc:
+        print(f"VkusVill AI selector fallback: {type(exc).__name__}", flush=True)
+
+    return shortlist[0], "fallback"
+
+
+async def _load_recent_order_context(session: ClientSession) -> str:
+    try:
+        result = await session.call_tool(
+            "vkusvill_orders_history",
+            {"page": 1},
+        )
+        if getattr(result, "isError", False):
+            return ""
+        return _compact_history_context(_extract_payload(result))
+    except Exception:
+        return ""
 
 
 async def build_cart_direct(user_text: str, access_token: str | None = None) -> dict:
