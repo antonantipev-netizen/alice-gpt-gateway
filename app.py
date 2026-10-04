@@ -1,139 +1,22 @@
 import os
 import re
 import json
+import base64
+import hashlib
+import hmac
+import secrets
+import time
 from pathlib import Path
 from threading import Lock, Thread
+from urllib.parse import urlencode
 
 import requests
 import httpx
-from flask import Flask, jsonify, request
-from vkusvill_direct import build_cart_direct_sync, diagnose_vkusvill_mcp_sync
+from flask import Flask, jsonify, request, redirect
+from vkusvill_direct import build_cart_direct_sync
 
 app = Flask(__name__)
 
-def _probe_vkusvill_oauth_metadata():
-    if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") != "1":
-        return
-
-    urls = [
-        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
-        "https://mcp.vkusvill.ru/mcp/.well-known/oauth-protected-resource",
-        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
-        "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
-        "https://mcp.vkusvill.ru/.well-known/openid-configuration",
-    ]
-    for url in urls:
-        try:
-            resp = requests.get(
-                url,
-                timeout=8,
-                allow_redirects=False,
-                headers={"Accept": "application/json"},
-            )
-            safe_headers = {
-                k: v for k, v in resp.headers.items()
-                if k.lower() in {
-                    "www-authenticate", "location", "content-type",
-                    "server", "allow"
-                }
-            }
-            print(
-                f"VKOAUTH_PROBE url={url} status={resp.status_code} "
-                f"headers={safe_headers!r} body={resp.text[:1500]!r}",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"VKOAUTH_PROBE url={url} error={exc}", flush=True)
-
-    try:
-        for url in [
-            "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
-            "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
-            "https://oauth.vkusvill.ru/.well-known/oauth-authorization-server",
-            "https://oauth.vkusvill.ru/.well-known/openid-configuration",
-        ]:
-            try:
-                r = httpx.get(
-                    url,
-                    timeout=8.0,
-                    follow_redirects=False,
-                    headers={"Accept": "application/json"},
-                )
-                safe_headers = {
-                    k: v for k, v in r.headers.items()
-                    if k.lower() in {
-                        "www-authenticate", "location", "content-type",
-                        "server", "allow"
-                    }
-                }
-                print(
-                    f"VKOAUTH_HTTPX url={url} status={r.status_code} "
-                    f"headers={safe_headers!r} body={r.text[:2000]!r}",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(f"VKOAUTH_HTTPX url={url} error={exc}", flush=True)
-
-        diag = diagnose_vkusvill_mcp_sync()
-        tool_names = [x.get("name") for x in diag.get("tools", [])]
-        print(f"VKOAUTH_MCP_TOOLS count={len(tool_names)} names={tool_names!r}", flush=True)
-        for tool in diag.get("tools", []):
-            if any(k in (tool.get("name") or "").lower() for k in ("order", "history", "discount", "recommend", "favorite")):
-                print(f"VKOAUTH_MCP_TOOL_DETAIL {tool!r}", flush=True)
-    except Exception as exc:
-        print(f"VKOAUTH_MCP_TOOLS error={exc}", flush=True)
-
-    try:
-        direct = build_cart_direct_sync("молоко")
-        print(
-            f"VKOAUTH_REAL_MCP success={bool(direct.get('success'))} "
-            f"items={len(direct.get('selected', []))} "
-            f"url_present={bool(direct.get('cart_url'))} "
-            f"message={direct.get('message', '')!r}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"VKOAUTH_REAL_MCP error={exc}", flush=True)
-
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "jarvis-oauth-probe", "version": "1.0"},
-            },
-        }
-        resp = requests.post(
-            "https://mcp.vkusvill.ru/mcp",
-            json=payload,
-            timeout=12,
-            allow_redirects=False,
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-            },
-        )
-        safe_headers = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() in {
-                "www-authenticate", "location", "content-type",
-                "server", "allow", "mcp-session-id"
-            }
-        }
-        print(
-            f"VKOAUTH_MCP_INIT status={resp.status_code} "
-            f"headers={safe_headers!r} body={resp.text[:2500]!r}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"VKOAUTH_MCP_INIT error={exc}", flush=True)
-
-
-if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") == "1":
-    Thread(target=_probe_vkusvill_oauth_metadata, daemon=True).start()
 
 VKUSVILL_JOBS = {}
 VKUSVILL_JOBS_LOCK = Lock()
@@ -145,6 +28,21 @@ MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-20b")
 FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"))
 SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
+VKUSVILL_OAUTH_CLIENT_ID = os.getenv("VKUSVILL_OAUTH_CLIENT_ID", "").strip()
+VKUSVILL_OAUTH_CLIENT_SECRET = os.getenv("VKUSVILL_OAUTH_CLIENT_SECRET", "").strip()
+VKUSVILL_OAUTH_REDIRECT_URI = os.getenv(
+    "VKUSVILL_OAUTH_REDIRECT_URI",
+    "https://alice-gpt-gateway.onrender.com/vkusvill/oauth/callback",
+).strip()
+VKUSVILL_OAUTH_AUTHORIZE_URL = "https://oauth.vkusvill.ru/oauth2/auth"
+VKUSVILL_OAUTH_TOKEN_URL = "https://oauth.vkusvill.ru/oauth2/token"
+VKUSVILL_OAUTH_SCOPE = (
+    "catalog.search purchase_history.read discounts.view recommendations.personalized"
+)
+VKUSVILL_OAUTH_TOKEN_PATH = Path(
+    os.getenv("VKUSVILL_OAUTH_TOKEN_PATH", "/tmp/vkusvill_oauth_token.json")
+)
+VKUSVILL_OAUTH_STATE_MAX_AGE = 15 * 60
 
 WORK_CONTEXT_PATH = Path(os.getenv("WORK_CONTEXT_PATH", "work_context.json"))
 
@@ -890,6 +788,105 @@ def make_alice_response(
     return result
 
 
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _oauth_configured() -> bool:
+    return bool(
+        VKUSVILL_OAUTH_CLIENT_ID
+        and VKUSVILL_OAUTH_CLIENT_SECRET
+        and VKUSVILL_OAUTH_REDIRECT_URI
+    )
+
+
+def _make_vkusvill_oauth_state(code_verifier: str) -> str:
+    payload = {
+        "v": code_verifier,
+        "iat": int(time.time()),
+        "n": secrets.token_urlsafe(12),
+    }
+    encoded = _b64url_encode(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    signature = _b64url_encode(
+        hmac.new(
+            VKUSVILL_OAUTH_CLIENT_SECRET.encode("utf-8"),
+            encoded.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    )
+    return f"{encoded}.{signature}"
+
+
+def _read_vkusvill_oauth_state(state: str) -> str:
+    try:
+        encoded, signature = state.split(".", 1)
+        expected = _b64url_encode(
+            hmac.new(
+                VKUSVILL_OAUTH_CLIENT_SECRET.encode("utf-8"),
+                encoded.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid signature")
+        payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
+        issued_at = int(payload.get("iat", 0))
+        if issued_at <= 0 or abs(int(time.time()) - issued_at) > VKUSVILL_OAUTH_STATE_MAX_AGE:
+            raise ValueError("state expired")
+        verifier = str(payload.get("v", ""))
+        if not verifier:
+            raise ValueError("missing verifier")
+        return verifier
+    except Exception as exc:
+        raise ValueError("invalid or expired OAuth state") from exc
+
+
+def _save_vkusvill_tokens(tokens: dict) -> None:
+    payload = dict(tokens)
+    payload["saved_at"] = int(time.time())
+    expires_in = payload.get("expires_in")
+    try:
+        payload["expires_at"] = int(time.time()) + int(expires_in)
+    except (TypeError, ValueError):
+        payload["expires_at"] = None
+
+    VKUSVILL_OAUTH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = VKUSVILL_OAUTH_TOKEN_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, VKUSVILL_OAUTH_TOKEN_PATH)
+
+
+def _load_vkusvill_tokens() -> dict:
+    try:
+        payload = json.loads(VKUSVILL_OAUTH_TOKEN_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _vkusvill_oauth_public_status() -> dict:
+    tokens = _load_vkusvill_tokens()
+    expires_at = tokens.get("expires_at")
+    remaining = None
+    if isinstance(expires_at, int):
+        remaining = max(0, expires_at - int(time.time()))
+    return {
+        "oauth_configured": _oauth_configured(),
+        "connected": bool(tokens.get("access_token")),
+        "refresh_token_present": bool(tokens.get("refresh_token")),
+        "scope": tokens.get("scope"),
+        "expires_in_seconds": remaining,
+    }
+
+
 @app.get("/")
 def root():
     return jsonify(
@@ -946,6 +943,38 @@ def search_web():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/vkusvill/oauth/start")
+def vkusvill_oauth_start():
+    if not _oauth_configured():
+        return jsonify({"error": "VkusVill OAuth is not configured"}), 503
+
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = _b64url_encode(
+        hashlib.sha256(code_verifier.encode("ascii")).digest()
+    )
+    state = _make_vkusvill_oauth_state(code_verifier)
+
+    params = {
+        "response_type": "code",
+        "client_id": VKUSVILL_OAUTH_CLIENT_ID,
+        "redirect_uri": VKUSVILL_OAUTH_REDIRECT_URI,
+        "scope": VKUSVILL_OAUTH_SCOPE,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "resource": VKUSVILL_MCP_URL,
+    }
+    return redirect(
+        f"{VKUSVILL_OAUTH_AUTHORIZE_URL}?{urlencode(params)}",
+        code=302,
+    )
+
+
+@app.get("/vkusvill/oauth/status")
+def vkusvill_oauth_status():
+    return jsonify(_vkusvill_oauth_public_status())
+
+
 @app.get("/vkusvill/oauth/callback")
 def vkusvill_oauth_callback():
     error = request.args.get("error", "").strip()
@@ -961,102 +990,93 @@ def vkusvill_oauth_callback():
 
     code = request.args.get("code", "").strip()
     state = request.args.get("state", "").strip()
-
-    if not code:
+    if not code or not state:
         return (
-            "OAuth callback ВкусВилла работает. Код авторизации пока не передан.",
-            200,
+            "В callback не пришли code/state. Запусти подключение заново.",
+            400,
             {"Content-Type": "text/plain; charset=utf-8"},
         )
 
-    # Do not log or expose the authorization code. Token exchange will be
-    # implemented after VkusVill issues client credentials.
+    try:
+        code_verifier = _read_vkusvill_oauth_state(state)
+    except ValueError:
+        return (
+            "Сессия подключения устарела или повреждена. Запусти подключение заново.",
+            400,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": VKUSVILL_OAUTH_REDIRECT_URI,
+        "client_id": VKUSVILL_OAUTH_CLIENT_ID,
+        "client_secret": VKUSVILL_OAUTH_CLIENT_SECRET,
+        "code_verifier": code_verifier,
+        "resource": VKUSVILL_MCP_URL,
+    }
+
+    try:
+        token_response = httpx.post(
+            VKUSVILL_OAUTH_TOKEN_URL,
+            data=token_data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=15.0,
+            follow_redirects=False,
+        )
+    except Exception as exc:
+        print(f"VkusVill OAuth token request failed: {type(exc).__name__}", flush=True)
+        return (
+            "ВкусВилл подтвердил вход, но Джарвис не смог получить токен. Попробуй ещё раз.",
+            502,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    if token_response.status_code not in (200, 201):
+        safe_body = token_response.text[:600]
+        print(
+            f"VkusVill OAuth token exchange failed: status={token_response.status_code} body={safe_body!r}",
+            flush=True,
+        )
+        return (
+            "Не получилось завершить OAuth ВкусВилла. "
+            f"Token endpoint вернул HTTP {token_response.status_code}.",
+            502,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    try:
+        tokens = token_response.json()
+    except Exception:
+        return (
+            "ВкусВилл вернул некорректный ответ при выдаче токена.",
+            502,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    if not isinstance(tokens, dict) or not tokens.get("access_token"):
+        return (
+            "ВкусВилл не вернул access token.",
+            502,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    _save_vkusvill_tokens(tokens)
     print(
-        f"VkusVill OAuth callback received: code_present=True state_present={bool(state)}",
+        "VkusVill OAuth connected: "
+        f"refresh_token_present={bool(tokens.get('refresh_token'))} "
+        f"scope_present={bool(tokens.get('scope'))}",
         flush=True,
     )
     return (
-        "Авторизация ВкусВилл получена. Можно вернуться к Джарвису.",
+        "ВкусВилл подключён к Джарвису. Авторизация завершена. "
+        "Можно закрыть эту страницу и вернуться в чат.",
         200,
         {"Content-Type": "text/plain; charset=utf-8"},
     )
-
-
-@app.get("/vkusvill/oauth/diagnostic")
-def vkusvill_oauth_diagnostic():
-    results = []
-    urls = [
-        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
-        "https://mcp.vkusvill.ru/mcp/.well-known/oauth-protected-resource",
-        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
-        "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
-        "https://mcp.vkusvill.ru/.well-known/openid-configuration",
-    ]
-
-    for url in urls:
-        item = {"url": url}
-        try:
-            resp = requests.get(
-                url,
-                timeout=8,
-                allow_redirects=False,
-                headers={"Accept": "application/json"},
-            )
-            item["status"] = resp.status_code
-            item["headers"] = {
-                k: v for k, v in resp.headers.items()
-                if k.lower() in {
-                    "www-authenticate", "location", "content-type",
-                    "server", "allow"
-                }
-            }
-            body = resp.text[:3000]
-            if "application/json" in resp.headers.get("content-type", ""):
-                try:
-                    item["json"] = resp.json()
-                except Exception:
-                    item["body"] = body
-            else:
-                item["body"] = body
-        except Exception as exc:
-            item["error"] = str(exc)
-        results.append(item)
-
-    mcp = {"url": "https://mcp.vkusvill.ru/mcp"}
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "jarvis-oauth-diagnostic", "version": "1.0"},
-            },
-        }
-        resp = requests.post(
-            mcp["url"],
-            json=payload,
-            timeout=12,
-            allow_redirects=False,
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-            },
-        )
-        mcp["status"] = resp.status_code
-        mcp["headers"] = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() in {
-                "www-authenticate", "location", "content-type",
-                "server", "allow", "mcp-session-id"
-            }
-        }
-        mcp["body"] = resp.text[:4000]
-    except Exception as exc:
-        mcp["error"] = str(exc)
-
-    return jsonify({"checks": results, "mcp_initialize": mcp})
 
 
 @app.get("/vkusvill-direct")
