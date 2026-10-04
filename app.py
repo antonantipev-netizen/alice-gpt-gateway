@@ -49,7 +49,8 @@ def _probe_vkusvill_oauth_metadata():
         for url in [
             "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
             "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
-            "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
+            "https://oauth.vkusvill.ru/.well-known/oauth-authorization-server",
+            "https://oauth.vkusvill.ru/.well-known/openid-configuration",
         ]:
             try:
                 r = httpx.get(
