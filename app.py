@@ -1843,15 +1843,34 @@ def alice():
 
     try:
         vkusvill_job_key = get_vkusvill_job_key(session)
+        active_cart = _load_vkusvill_active_cart(vkusvill_job_key)
+        cart_edit = parse_vkusvill_cart_edit(command_for_memory)
+        edit_is_contextual = bool(
+            cart_edit
+            and (
+                active_cart.get("items")
+                or "корзин" in command_for_memory.lower()
+                or "вкусвилл" in command_for_memory.lower()
+                or "вкус вилл" in command_for_memory.lower()
+            )
+        )
 
-        if is_vkusvill_status_intent(command_for_memory):
+        if is_vkusvill_cart_show_intent(command_for_memory):
+            answer = _describe_vkusvill_active_cart(active_cart)
+        elif edit_is_contextual:
+            start_vkusvill_cart_edit_job(vkusvill_job_key, cart_edit)
+            answer = (
+                "Принял. Обновляю корзину ВкусВилла. "
+                "Через несколько секунд спроси: Джарвис, корзина готова?"
+            )
+        elif is_vkusvill_status_intent(command_for_memory):
             job = get_vkusvill_job(vkusvill_job_key)
             if job.get("status") == "done":
                 answer = job.get("result") or "Корзина готова, но ссылка не найдена."
             elif job.get("status") == "error":
-                answer = "Не получилось собрать корзину. Повтори команду ещё раз."
+                answer = job.get("result") or "Не получилось обновить корзину."
             elif job.get("status") == "working":
-                answer = "Корзина ещё собирается. Спроси меня о ней ещё раз."
+                answer = "Корзина ещё обновляется. Спроси меня о ней ещё раз."
             else:
                 answer = "У меня сейчас нет активной корзины ВкусВилла."
         elif is_vkusvill_intent(command_for_memory):
