@@ -957,13 +957,19 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                     item["quantity"] = 1
                     items.append(item)
 
-                _save_vkusvill_active_cart(
-                    job_key,
-                    {
-                        "items": items,
-                        "cart_url": direct.get("cart_url"),
-                    },
-                )
+                cart = {
+                    "items": items,
+                    "cart_url": direct.get("cart_url"),
+                }
+                _save_vkusvill_active_cart(job_key, cart)
+                if CHECKOUT_WORKER_TOKEN:
+                    try:
+                        _create_checkout_task(job_key, cart)
+                    except Exception as exc:
+                        print(
+                            f"Checkout background prepare failed: {type(exc).__name__}",
+                            flush=True,
+                        )
 
                 names = [
                     item.get("name")
@@ -1117,6 +1123,14 @@ def start_vkusvill_cart_edit_job(job_key: str, edit: dict) -> None:
                 "cart_url": link_result.get("cart_url"),
             }
             _save_vkusvill_active_cart(job_key, cart)
+            if CHECKOUT_WORKER_TOKEN:
+                try:
+                    _create_checkout_task(job_key, cart)
+                except Exception as exc:
+                    print(
+                        f"Checkout background prepare failed: {type(exc).__name__}",
+                        flush=True,
+                    )
             _save_vkusvill_job(
                 job_key,
                 {"status": "done", "result": _describe_vkusvill_active_cart(cart)},
