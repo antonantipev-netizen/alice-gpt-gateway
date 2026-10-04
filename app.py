@@ -16,7 +16,8 @@ VKUSVILL_JOBS_LOCK = Lock()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_RESPONSES_URL = "https://api.groq.com/openai/v1/responses"
-MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-20b")
+FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"))
 SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
 VKUSVILL_MCP_URL = os.getenv("VKUSVILL_MCP_URL", "https://mcp.vkusvill.ru/mcp")
 
@@ -387,6 +388,26 @@ def call_groq(user_text: str, history: list[dict], memory: str) -> str:
         timeout=3.2,
     )
 
+    if response.status_code == 429 and FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        print(f"Groq primary rate-limited, fallback={FALLBACK_MODEL}", flush=True)
+        fallback_payload = {
+            "model": FALLBACK_MODEL,
+            "messages": messages,
+            "temperature": 0.6,
+            "reasoning_effort": "low",
+            "reasoning_format": "hidden",
+            "max_completion_tokens": 220,
+        }
+        response = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=fallback_payload,
+            timeout=3.0,
+        )
+
     if not response.ok:
         raise RuntimeError(f"Groq {response.status_code}: {response.text[:500]}")
 
@@ -477,6 +498,31 @@ def call_work_agent(user_text: str, history: list[dict], memory: str = "") -> st
         },
         timeout=3.2,
     )
+
+    if response.status_code == 429 and FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        print(f"Work agent primary rate-limited, fallback={FALLBACK_MODEL}", flush=True)
+        response = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": FALLBACK_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Ты аккуратный рабочий ассистент. Не добавляй факты, которых нет в переданном контексте.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "reasoning_effort": "low",
+                "reasoning_format": "hidden",
+                "max_completion_tokens": 200,
+            },
+            timeout=3.0,
+        )
 
     if not response.ok:
         raise RuntimeError(f"Work agent {response.status_code}: {response.text[:500]}")
