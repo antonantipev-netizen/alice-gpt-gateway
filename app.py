@@ -685,10 +685,132 @@ def is_vkusvill_status_intent(text: str) -> bool:
     low = normalize_text(text).lower()
     phrases = (
         "корзина готова", "готова корзина", "что с корзиной",
-        "покажи корзину", "дай корзину", "ссылка на корзину",
-        "где корзина", "где ссылка",
+        "обновилась корзина", "корзина обновилась",
     )
     return any(p in low for p in phrases)
+
+
+def is_vkusvill_cart_show_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    phrases = (
+        "что в корзине", "что сейчас в корзине", "покажи корзину",
+        "состав корзины", "дай корзину", "дай ссылку",
+        "ссылка на корзину", "где корзина", "где ссылка",
+    )
+    return any(p in low for p in phrases)
+
+
+VKUSVILL_NUMBER_WORDS = {
+    "ноль": 0,
+    "один": 1, "одна": 1, "одно": 1, "одну": 1,
+    "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5,
+    "шесть": 6, "семь": 7, "восемь": 8,
+    "девять": 9, "десять": 10,
+}
+
+
+def _parse_vkusvill_quantity(value: str) -> int | None:
+    token = normalize_text(value).lower().strip(" .!?")
+    if token.isdigit():
+        number = int(token)
+        return number if 0 <= number <= 20 else None
+    return VKUSVILL_NUMBER_WORDS.get(token)
+
+
+def _split_vkusvill_queries(value: str) -> list[str]:
+    cleaned = normalize_text(value)
+    cleaned = re.sub(r"\s+в\s+корзину\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^(?:ещ[её]\s+)", "", cleaned, flags=re.I)
+    parts = re.split(r"[,;]|\s+и\s+", cleaned, flags=re.I)
+    result = []
+    seen = set()
+    for part in parts:
+        item = normalize_text(part).strip(" .!?")
+        key = item.lower()
+        if len(item) < 2 or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result[:20]
+
+
+def parse_vkusvill_cart_edit(text: str) -> dict | None:
+    value = normalize_text(text).strip(" .!?")
+    low = value.lower()
+
+    if re.search(r"\b(?:очисти|очистить)\s+корзин", low):
+        return {"action": "clear"}
+
+    match = re.match(
+        r"^(?:замени|поменяй)(?:\s+в\s+корзине)?\s+(.+?)\s+на\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "replace",
+            "old": match.group(1).strip(),
+            "new": match.group(2).strip(),
+        }
+
+    match = re.match(
+        r"^(?:убери|удали|исключи)(?:\s+из\s+корзины)?\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "remove",
+            "queries": _split_vkusvill_queries(match.group(1)),
+        }
+
+    qty_pattern = (
+        r"(\d+|ноль|один|одна|одно|одну|два|две|три|четыре|пять|"
+        r"шесть|семь|восемь|девять|десять)"
+    )
+    match = re.match(
+        rf"^(.+?)\s+(?:сделай|поставь)\s+{qty_pattern}"
+        rf"(?:\s+(?:шт\.?|штук\w*|упаков\w*))?$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        quantity = _parse_vkusvill_quantity(match.group(2))
+        if quantity is not None:
+            return {
+                "action": "set_quantity",
+                "query": match.group(1).strip(),
+                "quantity": quantity,
+            }
+
+    match = re.match(
+        rf"^(?:сделай|поставь)\s+(.+?)\s+{qty_pattern}"
+        rf"(?:\s+(?:шт\.?|штук\w*|упаков\w*))?$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        quantity = _parse_vkusvill_quantity(match.group(2))
+        if quantity is not None:
+            return {
+                "action": "set_quantity",
+                "query": match.group(1).strip(),
+                "quantity": quantity,
+            }
+
+    match = re.match(
+        r"^(?:добавь|положи)(?:\s+в\s+корзину)?\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "add",
+            "queries": _split_vkusvill_queries(match.group(1)),
+        }
+
+    return None
 
 
 def _vkusvill_job_redis_key(job_key: str) -> str:
