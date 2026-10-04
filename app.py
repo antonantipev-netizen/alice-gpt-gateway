@@ -14,7 +14,12 @@ import requests
 import httpx
 import redis
 from flask import Flask, jsonify, request, redirect
-from vkusvill_direct import build_cart_direct_sync, check_authenticated_vkusvill_sync
+from vkusvill_direct import (
+    build_cart_direct_sync,
+    check_authenticated_vkusvill_sync,
+    resolve_product_queries_sync,
+    create_cart_link_from_items_sync,
+)
 
 app = Flask(__name__)
 
