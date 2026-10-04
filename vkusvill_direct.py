@@ -268,15 +268,32 @@ async def build_cart_direct(user_text: str, access_token: str | None = None) -> 
                     )
                     return q, _extract_products(_extract_payload(result))
 
+                history_context = (
+                    await _load_recent_order_context(session)
+                    if access_token
+                    else ""
+                )
                 results = await asyncio.gather(*(search_one(q) for q in targets))
+                decisions = await asyncio.gather(
+                    *(
+                        _choose_product_with_ai(
+                            q,
+                            items,
+                            history_context=history_context,
+                        )
+                        for q, items in results
+                    )
+                )
                 selected = []
                 missing = []
+                ai_selected = 0
 
-                for q, items in results:
-                    item = _choose_product(q, items)
+                for (q, _items), (item, source) in zip(results, decisions):
                     if not item:
                         missing.append(q)
                         continue
+                    if source == "ai":
+                        ai_selected += 1
                     pid = _product_id(item)
                     selected.append(
                         {
@@ -285,6 +302,7 @@ async def build_cart_direct(user_text: str, access_token: str | None = None) -> 
                             "name": _name(item),
                             "price": _price(item),
                             "rating": _rating(item),
+                            "selection_source": source,
                         }
                     )
 
@@ -312,6 +330,8 @@ async def build_cart_direct(user_text: str, access_token: str | None = None) -> 
                     "cart_url": url,
                     "selected": selected,
                     "missing": missing,
+                    "ai_selected": ai_selected,
+                    "history_context_used": bool(history_context),
                 }
 
 
@@ -358,17 +378,34 @@ async def resolve_product_queries(
                     )
                     return query, _extract_products(_extract_payload(result))
 
+                history_context = (
+                    await _load_recent_order_context(session)
+                    if access_token
+                    else ""
+                )
                 results = await asyncio.gather(
                     *(search_one(query) for query in clean_queries)
+                )
+                decisions = await asyncio.gather(
+                    *(
+                        _choose_product_with_ai(
+                            query,
+                            items,
+                            history_context=history_context,
+                        )
+                        for query, items in results
+                    )
                 )
 
                 selected = []
                 missing = []
-                for query, items in results:
-                    item = _choose_product(query, items)
+                ai_selected = 0
+                for (query, _items), (item, source) in zip(results, decisions):
                     if not item:
                         missing.append(query)
                         continue
+                    if source == "ai":
+                        ai_selected += 1
                     product_id = _product_id(item)
                     selected.append(
                         {
@@ -378,6 +415,7 @@ async def resolve_product_queries(
                             "price": _price(item),
                             "rating": _rating(item),
                             "quantity": 1,
+                            "selection_source": source,
                         }
                     )
 
@@ -385,6 +423,8 @@ async def resolve_product_queries(
                     "success": bool(selected),
                     "selected": selected,
                     "missing": missing,
+                    "ai_selected": ai_selected,
+                    "history_context_used": bool(history_context),
                 }
 
 
