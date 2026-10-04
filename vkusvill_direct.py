@@ -141,71 +141,82 @@ def _choose_product(query: str, items: list[dict]) -> dict | None:
     return ranked[0][3]
 
 
-async def build_cart_direct(user_text: str) -> dict:
+async def build_cart_direct(user_text: str, access_token: str | None = None) -> dict:
     targets = parse_targets(user_text)
     if not targets:
         return {"success": False, "message": "Не понял список товаров."}
 
-    async with streamable_http_client(MCP_URL) as (read_stream, write_stream, _):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
+    client_headers = {}
+    if access_token:
+        client_headers["Authorization"] = "Bearer " + access_token
 
-            async def search_one(q: str):
-                result = await session.call_tool(
-                    "vkusvill_products_search",
-                    {"q": q, "page": 1, "sort": "rating"},
+    async with httpx.AsyncClient(
+        headers=client_headers,
+        timeout=httpx.Timeout(20.0, read=60.0),
+    ) as http_client:
+        async with streamable_http_client(
+            MCP_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+
+                async def search_one(q: str):
+                    result = await session.call_tool(
+                        "vkusvill_products_search",
+                        {"q": q, "page": 1, "sort": "rating"},
+                    )
+                    return q, _extract_products(_extract_payload(result))
+
+                results = await asyncio.gather(*(search_one(q) for q in targets))
+                selected = []
+                missing = []
+
+                for q, items in results:
+                    item = _choose_product(q, items)
+                    if not item:
+                        missing.append(q)
+                        continue
+                    pid = _product_id(item)
+                    selected.append(
+                        {
+                            "query": q,
+                            "xml_id": pid,
+                            "name": _name(item),
+                            "price": _price(item),
+                            "rating": _rating(item),
+                        }
+                    )
+
+                if not selected:
+                    return {"success": False, "message": "Не удалось найти товары.", "missing": missing}
+
+                cart_result = await session.call_tool(
+                    "vkusvill_cart_link_create",
+                    {"products": [{"xml_id": x["xml_id"], "q": 1.0} for x in selected]},
                 )
-                return q, _extract_products(_extract_payload(result))
+                payload = _extract_payload(cart_result)
+                url = None
+                if isinstance(payload, dict):
+                    url = payload.get("url") or payload.get("cart_url") or payload.get("link")
+                elif isinstance(payload, str):
+                    m = re.search(r"https?://[^\s\"']+", payload)
+                    url = m.group(0) if m else None
+                if not url:
+                    blob = json.dumps(payload, ensure_ascii=False)
+                    m = re.search(r"https?://[^\s\"']+", blob)
+                    url = m.group(0) if m else None
 
-            results = await asyncio.gather(*(search_one(q) for q in targets))
-            selected = []
-            missing = []
-
-            for q, items in results:
-                item = _choose_product(q, items)
-                if not item:
-                    missing.append(q)
-                    continue
-                pid = _product_id(item)
-                selected.append(
-                    {
-                        "query": q,
-                        "xml_id": pid,
-                        "name": _name(item),
-                        "price": _price(item),
-                        "rating": _rating(item),
-                    }
-                )
-
-            if not selected:
-                return {"success": False, "message": "Не удалось найти товары.", "missing": missing}
-
-            cart_result = await session.call_tool(
-                "vkusvill_cart_link_create",
-                {"products": [{"xml_id": x["xml_id"], "q": 1.0} for x in selected]},
-            )
-            payload = _extract_payload(cart_result)
-            url = None
-            if isinstance(payload, dict):
-                url = payload.get("url") or payload.get("cart_url") or payload.get("link")
-            elif isinstance(payload, str):
-                m = re.search(r"https?://[^\s\"']+", payload)
-                url = m.group(0) if m else None
-            if not url:
-                blob = json.dumps(payload, ensure_ascii=False)
-                m = re.search(r"https?://[^\s\"']+", blob)
-                url = m.group(0) if m else None
-
-            return {
-                "success": bool(url),
-                "cart_url": url,
-                "selected": selected,
-                "missing": missing,
-            }
+                return {
+                    "success": bool(url),
+                    "cart_url": url,
+                    "selected": selected,
+                    "missing": missing,
+                }
 
 
-def build_cart_direct_sync(user_text: str) -> dict:
-    return asyncio.run(build_cart_direct(user_text))
+def build_cart_direct_sync(user_text: str, access_token: str | None = None) -> dict:
+    return asyncio.run(build_cart_direct(user_text, access_token=access_token))
 
 
 async def diagnose_vkusvill_mcp() -> dict:
