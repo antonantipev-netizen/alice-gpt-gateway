@@ -14,9 +14,37 @@ import requests
 import httpx
 import redis
 from flask import Flask, jsonify, request, redirect
-from vkusvill_direct import build_cart_direct_sync
+from vkusvill_direct import build_cart_direct_sync, check_authenticated_vkusvill_sync
 
 app = Flask(__name__)
+
+
+def _startup_vkusvill_auth_check():
+    # Wait until module initialization is complete before reading helpers.
+    time.sleep(3)
+    try:
+        tokens = _load_vkusvill_tokens()
+        access_token = str(tokens.get("access_token") or "")
+        if not access_token:
+            print("VKOAUTH_ACCOUNT_CHECK connected=False", flush=True)
+            return
+        result = check_authenticated_vkusvill_sync(access_token)
+        print(
+            "VKOAUTH_ACCOUNT_CHECK "
+            f"success={bool(result.get('success'))} "
+            f"orders_history_available={bool(result.get('orders_history_available'))} "
+            f"orders_returned={result.get('orders_returned')} "
+            f"tool_count={result.get('tool_count')} "
+            f"reason={result.get('reason')!r}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"VKOAUTH_ACCOUNT_CHECK error={type(exc).__name__}",
+            flush=True,
+        )
+
+
 
 
 VKUSVILL_JOBS = {}
@@ -988,6 +1016,40 @@ def search_web():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/vkusvill/oauth/check")
+def vkusvill_oauth_check():
+    tokens = _load_vkusvill_tokens()
+    access_token = str(tokens.get("access_token") or "")
+    if not access_token:
+        return jsonify({
+            "connected": False,
+            "authenticated_mcp": False,
+            "reason": "missing_access_token",
+        }), 401
+
+    try:
+        result = check_authenticated_vkusvill_sync(access_token)
+    except Exception as exc:
+        print(
+            f"VkusVill authenticated MCP check failed: {type(exc).__name__}",
+            flush=True,
+        )
+        return jsonify({
+            "connected": True,
+            "authenticated_mcp": False,
+            "reason": type(exc).__name__,
+        }), 502
+
+    return jsonify({
+        "connected": True,
+        "authenticated_mcp": bool(result.get("success")),
+        "orders_history_available": bool(result.get("orders_history_available")),
+        "orders_returned": result.get("orders_returned"),
+        "tool_count": result.get("tool_count"),
+        "reason": result.get("reason"),
+    })
+
+
 @app.get("/vkusvill/oauth/start")
 def vkusvill_oauth_start():
     if not _oauth_configured():
@@ -1397,3 +1459,7 @@ def alice():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+
+if os.getenv("VKUSVILL_AUTH_CHECK_ON_START", "1") == "1":
+    Thread(target=_startup_vkusvill_auth_check, daemon=True).start()
