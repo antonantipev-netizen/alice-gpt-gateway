@@ -821,6 +821,42 @@ def search_web():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/vkusvill/oauth/callback")
+def vkusvill_oauth_callback():
+    error = request.args.get("error", "").strip()
+    if error:
+        description = request.args.get("error_description", "").strip()
+        print(f"VkusVill OAuth callback error: {error}", flush=True)
+        return (
+            "Авторизация ВкусВилл не завершена. "
+            + (description or error),
+            400,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    code = request.args.get("code", "").strip()
+    state = request.args.get("state", "").strip()
+
+    if not code:
+        return (
+            "OAuth callback ВкусВилла работает. Код авторизации пока не передан.",
+            200,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    # Do not log or expose the authorization code. Token exchange will be
+    # implemented after VkusVill issues client credentials.
+    print(
+        f"VkusVill OAuth callback received: code_present=True state_present={bool(state)}",
+        flush=True,
+    )
+    return (
+        "Авторизация ВкусВилл получена. Можно вернуться к Джарвису.",
+        200,
+        {"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
 @app.get("/vkusvill-direct")
 def vkusvill_direct():
     text = request.args.get("q", "").strip()
