@@ -686,6 +686,28 @@ def is_vkusvill_status_intent(text: str) -> bool:
     return any(p in low for p in phrases)
 
 
+def _vkusvill_job_redis_key(job_key: str) -> str:
+    digest = hashlib.sha256(job_key.encode("utf-8")).hexdigest()
+    return f"jarvis:vkusvill:job:{digest}"
+
+
+def _save_vkusvill_job(job_key: str, payload: dict) -> None:
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            client.setex(
+                _vkusvill_job_redis_key(job_key),
+                6 * 60 * 60,
+                json.dumps(payload, ensure_ascii=False),
+            )
+            return
+        except Exception as exc:
+            print(f"Redis VkusVill job save failed: {type(exc).__name__}", flush=True)
+
+    with VKUSVILL_JOBS_LOCK:
+        VKUSVILL_JOBS[job_key] = dict(payload)
+
+
 def start_vkusvill_job(job_key: str, user_text: str) -> None:
     def worker():
         try:
@@ -696,7 +718,11 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 access_token=access_token or None,
             )
             if direct.get("success") and direct.get("cart_url"):
-                names = [item.get("name") for item in direct.get("selected", []) if item.get("name")]
+                names = [
+                    item.get("name")
+                    for item in direct.get("selected", [])
+                    if item.get("name")
+                ]
                 summary = ", ".join(names[:6])
                 result = "Корзина готова."
                 if summary:
@@ -710,21 +736,39 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                     flush=True,
                 )
             else:
-                payload = {"status": "error", "error": direct.get("message") or "cart_not_created"}
-                print(f"VkusVill direct failed: {direct}", flush=True)
+                payload = {
+                    "status": "error",
+                    "error": direct.get("message") or "cart_not_created",
+                }
+                print(
+                    f"VkusVill direct failed: authenticated={bool(access_token)}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(f"VkusVill direct async error: {exc}", flush=True)
-            payload = {"status": "error", "error": str(exc)}
-        with VKUSVILL_JOBS_LOCK:
-            VKUSVILL_JOBS[job_key] = payload
+            print(
+                f"VkusVill direct async error: {type(exc).__name__}",
+                flush=True,
+            )
+            payload = {"status": "error", "error": type(exc).__name__}
 
-    with VKUSVILL_JOBS_LOCK:
-        VKUSVILL_JOBS[job_key] = {"status": "working"}
+        _save_vkusvill_job(job_key, payload)
 
+    _save_vkusvill_job(job_key, {"status": "working"})
     Thread(target=worker, daemon=True).start()
 
 
 def get_vkusvill_job(job_key: str) -> dict:
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            raw = client.get(_vkusvill_job_redis_key(job_key))
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    return payload
+        except Exception as exc:
+            print(f"Redis VkusVill job load failed: {type(exc).__name__}", flush=True)
+
     with VKUSVILL_JOBS_LOCK:
         return dict(VKUSVILL_JOBS.get(job_key, {}))
 
