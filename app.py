@@ -14,7 +14,12 @@ import requests
 import httpx
 import redis
 from flask import Flask, jsonify, request, redirect
-from vkusvill_direct import build_cart_direct_sync, check_authenticated_vkusvill_sync
+from vkusvill_direct import (
+    build_cart_direct_sync,
+    check_authenticated_vkusvill_sync,
+    resolve_product_queries_sync,
+    create_cart_link_from_items_sync,
+)
 
 app = Flask(__name__)
 
@@ -680,15 +685,239 @@ def is_vkusvill_status_intent(text: str) -> bool:
     low = normalize_text(text).lower()
     phrases = (
         "корзина готова", "готова корзина", "что с корзиной",
-        "покажи корзину", "дай корзину", "ссылка на корзину",
-        "где корзина", "где ссылка",
+        "обновилась корзина", "корзина обновилась",
     )
     return any(p in low for p in phrases)
+
+
+def is_vkusvill_cart_show_intent(text: str) -> bool:
+    low = normalize_text(text).lower()
+    phrases = (
+        "что в корзине", "что сейчас в корзине", "покажи корзину",
+        "состав корзины", "дай корзину", "дай ссылку",
+        "ссылка на корзину", "где корзина", "где ссылка",
+    )
+    return any(p in low for p in phrases)
+
+
+VKUSVILL_NUMBER_WORDS = {
+    "ноль": 0,
+    "один": 1, "одна": 1, "одно": 1, "одну": 1,
+    "два": 2, "две": 2,
+    "три": 3, "четыре": 4, "пять": 5,
+    "шесть": 6, "семь": 7, "восемь": 8,
+    "девять": 9, "десять": 10,
+}
+
+
+def _parse_vkusvill_quantity(value: str) -> int | None:
+    token = normalize_text(value).lower().strip(" .!?")
+    if token.isdigit():
+        number = int(token)
+        return number if 0 <= number <= 20 else None
+    return VKUSVILL_NUMBER_WORDS.get(token)
+
+
+def _split_vkusvill_queries(value: str) -> list[str]:
+    cleaned = normalize_text(value)
+    cleaned = re.sub(r"\s+в\s+корзину\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^(?:ещ[её]\s+)", "", cleaned, flags=re.I)
+    parts = re.split(r"[,;]|\s+и\s+", cleaned, flags=re.I)
+    result = []
+    seen = set()
+    for part in parts:
+        item = normalize_text(part).strip(" .!?")
+        key = item.lower()
+        if len(item) < 2 or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result[:20]
+
+
+def parse_vkusvill_cart_edit(text: str) -> dict | None:
+    value = normalize_text(text).strip(" .!?")
+    low = value.lower()
+
+    if re.search(r"\b(?:очисти|очистить)\s+корзин", low):
+        return {"action": "clear"}
+
+    match = re.match(
+        r"^(?:замени|поменяй)(?:\s+в\s+корзине)?\s+(.+?)\s+на\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "replace",
+            "old": match.group(1).strip(),
+            "new": match.group(2).strip(),
+        }
+
+    match = re.match(
+        r"^(?:убери|удали|исключи)(?:\s+из\s+корзины)?\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "remove",
+            "queries": _split_vkusvill_queries(match.group(1)),
+        }
+
+    qty_pattern = (
+        r"(\d+|ноль|один|одна|одно|одну|два|две|три|четыре|пять|"
+        r"шесть|семь|восемь|девять|десять)"
+    )
+    match = re.match(
+        rf"^(.+?)\s+(?:сделай|поставь)\s+{qty_pattern}"
+        rf"(?:\s+(?:шт\.?|штук\w*|упаков\w*))?$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        quantity = _parse_vkusvill_quantity(match.group(2))
+        if quantity is not None:
+            return {
+                "action": "set_quantity",
+                "query": match.group(1).strip(),
+                "quantity": quantity,
+            }
+
+    match = re.match(
+        rf"^(?:сделай|поставь)\s+(.+?)\s+{qty_pattern}"
+        rf"(?:\s+(?:шт\.?|штук\w*|упаков\w*))?$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        quantity = _parse_vkusvill_quantity(match.group(2))
+        if quantity is not None:
+            return {
+                "action": "set_quantity",
+                "query": match.group(1).strip(),
+                "quantity": quantity,
+            }
+
+    match = re.match(
+        r"^(?:добавь|положи)(?:\s+в\s+корзину)?\s+(.+)$",
+        value,
+        flags=re.I,
+    )
+    if match:
+        return {
+            "action": "add",
+            "queries": _split_vkusvill_queries(match.group(1)),
+        }
+
+    return None
 
 
 def _vkusvill_job_redis_key(job_key: str) -> str:
     digest = hashlib.sha256(job_key.encode("utf-8")).hexdigest()
     return f"jarvis:vkusvill:job:{digest}"
+
+
+def _vkusvill_active_cart_redis_key(job_key: str) -> str:
+    digest = hashlib.sha256(job_key.encode("utf-8")).hexdigest()
+    return f"jarvis:vkusvill:active_cart:{digest}"
+
+
+def _save_vkusvill_active_cart(job_key: str, payload: dict) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        data = dict(payload)
+        data["updated_at"] = int(time.time())
+        client.setex(
+            _vkusvill_active_cart_redis_key(job_key),
+            7 * 24 * 60 * 60,
+            json.dumps(data, ensure_ascii=False),
+        )
+    except Exception as exc:
+        print(f"Redis active cart save failed: {type(exc).__name__}", flush=True)
+
+
+def _load_vkusvill_active_cart(job_key: str) -> dict:
+    client = _get_redis_client()
+    if client is None:
+        return {}
+    try:
+        raw = client.get(_vkusvill_active_cart_redis_key(job_key))
+        if raw:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload
+    except Exception as exc:
+        print(f"Redis active cart load failed: {type(exc).__name__}", flush=True)
+    return {}
+
+
+def _clear_vkusvill_active_cart(job_key: str) -> None:
+    client = _get_redis_client()
+    if client is None:
+        return
+    try:
+        client.delete(_vkusvill_active_cart_redis_key(job_key))
+    except Exception as exc:
+        print(f"Redis active cart clear failed: {type(exc).__name__}", flush=True)
+
+
+def _cart_item_matches(item: dict, query: str) -> bool:
+    target_tokens = [
+        token for token in re.findall(r"[а-яa-z0-9]+", query.lower())
+        if len(token) >= 3
+    ]
+    if not target_tokens:
+        return False
+    haystack = (
+        str(item.get("query") or "") + " " + str(item.get("name") or "")
+    ).lower()
+    return all(token[:4] in haystack for token in target_tokens)
+
+
+def _merge_cart_item(items: list[dict], new_item: dict, quantity: int = 1) -> None:
+    xml_id = new_item.get("xml_id")
+    for item in items:
+        if item.get("xml_id") == xml_id:
+            item["quantity"] = int(item.get("quantity") or 1) + quantity
+            return
+    value = dict(new_item)
+    value["quantity"] = quantity
+    items.append(value)
+
+
+def _describe_vkusvill_active_cart(cart: dict) -> str:
+    items = cart.get("items") if isinstance(cart, dict) else None
+    if not isinstance(items, list) or not items:
+        return "Активная корзина ВкусВилла пуста."
+
+    parts = []
+    total = 0.0
+    total_units = 0
+    for item in items[:10]:
+        quantity = int(item.get("quantity") or 1)
+        total_units += quantity
+        name = str(item.get("name") or item.get("query") or "товар")
+        parts.append(f"{name} ×{quantity}" if quantity != 1 else name)
+        try:
+            total += float(item.get("price") or 0) * quantity
+        except (TypeError, ValueError):
+            pass
+
+    text = "В корзине: " + ", ".join(parts)
+    if len(items) > 10:
+        text += f", и ещё {len(items) - 10} позиций"
+    text += f". Всего {total_units} товаров"
+    if total > 0:
+        text += f", примерно на {round(total)} рублей"
+    text += "."
+
+    cart_url = str(cart.get("cart_url") or "")
+    if cart_url:
+        text += " " + cart_url
+    return text
 
 
 def _save_vkusvill_job(job_key: str, payload: dict) -> None:
@@ -718,9 +947,23 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 access_token=access_token or None,
             )
             if direct.get("success") and direct.get("cart_url"):
+                items = []
+                for selected_item in direct.get("selected", []):
+                    item = dict(selected_item)
+                    item["quantity"] = 1
+                    items.append(item)
+
+                _save_vkusvill_active_cart(
+                    job_key,
+                    {
+                        "items": items,
+                        "cart_url": direct.get("cart_url"),
+                    },
+                )
+
                 names = [
                     item.get("name")
-                    for item in direct.get("selected", [])
+                    for item in items
                     if item.get("name")
                 ]
                 summary = ", ".join(names[:6])
@@ -732,7 +975,7 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                 print(
                     f"VkusVill direct success: items={len(names)} "
                     f"authenticated={bool(access_token)} "
-                    f"url={direct['cart_url']}",
+                    f"url_present={bool(direct.get('cart_url'))}",
                     flush=True,
                 )
             else:
@@ -752,6 +995,157 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
             payload = {"status": "error", "error": type(exc).__name__}
 
         _save_vkusvill_job(job_key, payload)
+
+    _save_vkusvill_job(job_key, {"status": "working"})
+    Thread(target=worker, daemon=True).start()
+
+
+def start_vkusvill_cart_edit_job(job_key: str, edit: dict) -> None:
+    def worker():
+        try:
+            action = edit.get("action")
+            cart = _load_vkusvill_active_cart(job_key)
+            items = list(cart.get("items") or [])
+
+            if action == "clear":
+                _clear_vkusvill_active_cart(job_key)
+                _save_vkusvill_job(
+                    job_key,
+                    {"status": "done", "result": "Корзину ВкусВилла очистил."},
+                )
+                return
+
+            if not items and action != "add":
+                _save_vkusvill_job(
+                    job_key,
+                    {
+                        "status": "error",
+                        "error": "no_active_cart",
+                        "result": "Сначала создай корзину ВкусВилла.",
+                    },
+                )
+                return
+
+            oauth_tokens = _load_vkusvill_tokens()
+            access_token = str(oauth_tokens.get("access_token") or "")
+
+            if action == "add":
+                queries = edit.get("queries") or []
+                resolved = resolve_product_queries_sync(
+                    queries,
+                    access_token=access_token or None,
+                )
+                for new_item in resolved.get("selected", []):
+                    _merge_cart_item(items, new_item, 1)
+                if not resolved.get("selected"):
+                    raise ValueError("product_not_found")
+
+            elif action == "remove":
+                targets = edit.get("queries") or []
+                before = len(items)
+                items = [
+                    item for item in items
+                    if not any(_cart_item_matches(item, target) for target in targets)
+                ]
+                if len(items) == before:
+                    raise ValueError("cart_item_not_found")
+
+            elif action == "replace":
+                old_query = str(edit.get("old") or "")
+                new_query = str(edit.get("new") or "")
+                matched = [
+                    item for item in items
+                    if _cart_item_matches(item, old_query)
+                ]
+                if not matched:
+                    raise ValueError("cart_item_not_found")
+                replacement_quantity = int(matched[0].get("quantity") or 1)
+                items = [
+                    item for item in items
+                    if not _cart_item_matches(item, old_query)
+                ]
+                resolved = resolve_product_queries_sync(
+                    [new_query],
+                    access_token=access_token or None,
+                )
+                selected = resolved.get("selected") or []
+                if not selected:
+                    raise ValueError("replacement_not_found")
+                _merge_cart_item(items, selected[0], replacement_quantity)
+
+            elif action == "set_quantity":
+                target = str(edit.get("query") or "")
+                quantity = int(edit.get("quantity") or 0)
+                found = False
+                updated_items = []
+                for item in items:
+                    if _cart_item_matches(item, target):
+                        found = True
+                        if quantity > 0:
+                            item = dict(item)
+                            item["quantity"] = quantity
+                            updated_items.append(item)
+                    else:
+                        updated_items.append(item)
+                if not found:
+                    raise ValueError("cart_item_not_found")
+                items = updated_items
+
+            if not items:
+                _clear_vkusvill_active_cart(job_key)
+                _save_vkusvill_job(
+                    job_key,
+                    {"status": "done", "result": "Корзина ВкусВилла теперь пуста."},
+                )
+                return
+
+            link_result = create_cart_link_from_items_sync(
+                items,
+                access_token=access_token or None,
+            )
+            if not link_result.get("success") or not link_result.get("cart_url"):
+                raise RuntimeError("cart_link_not_created")
+
+            cart = {
+                "items": items,
+                "cart_url": link_result.get("cart_url"),
+            }
+            _save_vkusvill_active_cart(job_key, cart)
+            _save_vkusvill_job(
+                job_key,
+                {"status": "done", "result": _describe_vkusvill_active_cart(cart)},
+            )
+            print(
+                f"VkusVill active cart updated: action={action} "
+                f"items={len(items)} authenticated={bool(access_token)}",
+                flush=True,
+            )
+
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "cart_item_not_found":
+                message = "Не нашёл такой товар в активной корзине."
+            elif reason == "replacement_not_found":
+                message = "Не удалось найти подходящую замену."
+            else:
+                message = "Не удалось найти подходящий товар."
+            _save_vkusvill_job(
+                job_key,
+                {"status": "error", "error": reason, "result": message},
+            )
+        except Exception as exc:
+            print(
+                f"VkusVill active cart edit error: {type(exc).__name__}",
+                flush=True,
+            )
+            _save_vkusvill_job(
+                job_key,
+                {
+                    "status": "error",
+                    "error": type(exc).__name__,
+                    "result": "Не получилось обновить корзину.",
+                },
+            )
 
     _save_vkusvill_job(job_key, {"status": "working"})
     Thread(target=worker, daemon=True).start()
@@ -1449,15 +1843,34 @@ def alice():
 
     try:
         vkusvill_job_key = get_vkusvill_job_key(session)
+        active_cart = _load_vkusvill_active_cart(vkusvill_job_key)
+        cart_edit = parse_vkusvill_cart_edit(command_for_memory)
+        edit_is_contextual = bool(
+            cart_edit
+            and (
+                active_cart.get("items")
+                or "корзин" in command_for_memory.lower()
+                or "вкусвилл" in command_for_memory.lower()
+                or "вкус вилл" in command_for_memory.lower()
+            )
+        )
 
-        if is_vkusvill_status_intent(command_for_memory):
+        if is_vkusvill_cart_show_intent(command_for_memory):
+            answer = _describe_vkusvill_active_cart(active_cart)
+        elif edit_is_contextual:
+            start_vkusvill_cart_edit_job(vkusvill_job_key, cart_edit)
+            answer = (
+                "Принял. Обновляю корзину ВкусВилла. "
+                "Через несколько секунд спроси: Джарвис, корзина готова?"
+            )
+        elif is_vkusvill_status_intent(command_for_memory):
             job = get_vkusvill_job(vkusvill_job_key)
             if job.get("status") == "done":
                 answer = job.get("result") or "Корзина готова, но ссылка не найдена."
             elif job.get("status") == "error":
-                answer = "Не получилось собрать корзину. Повтори команду ещё раз."
+                answer = job.get("result") or "Не получилось обновить корзину."
             elif job.get("status") == "working":
-                answer = "Корзина ещё собирается. Спроси меня о ней ещё раз."
+                answer = "Корзина ещё обновляется. Спроси меня о ней ещё раз."
             else:
                 answer = "У меня сейчас нет активной корзины ВкусВилла."
         elif is_vkusvill_intent(command_for_memory):

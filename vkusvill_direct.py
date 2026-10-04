@@ -219,6 +219,146 @@ def build_cart_direct_sync(user_text: str, access_token: str | None = None) -> d
     return asyncio.run(build_cart_direct(user_text, access_token=access_token))
 
 
+async def resolve_product_queries(
+    queries: list[str],
+    access_token: str | None = None,
+) -> dict:
+    clean_queries = []
+    seen = set()
+    for query in queries:
+        value = re.sub(r"\s+", " ", str(query or "")).strip(" .!?")
+        key = value.lower()
+        if len(value) < 2 or key in seen:
+            continue
+        seen.add(key)
+        clean_queries.append(value)
+
+    if not clean_queries:
+        return {"success": False, "selected": [], "missing": []}
+
+    headers = {}
+    if access_token:
+        headers["Authorization"] = "Bearer " + access_token
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=httpx.Timeout(20.0, read=60.0),
+    ) as http_client:
+        async with streamable_http_client(
+            MCP_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+
+                async def search_one(query: str):
+                    result = await session.call_tool(
+                        "vkusvill_products_search",
+                        {"q": query, "page": 1, "sort": "rating"},
+                    )
+                    return query, _extract_products(_extract_payload(result))
+
+                results = await asyncio.gather(
+                    *(search_one(query) for query in clean_queries)
+                )
+
+                selected = []
+                missing = []
+                for query, items in results:
+                    item = _choose_product(query, items)
+                    if not item:
+                        missing.append(query)
+                        continue
+                    product_id = _product_id(item)
+                    selected.append(
+                        {
+                            "query": query,
+                            "xml_id": product_id,
+                            "name": _name(item),
+                            "price": _price(item),
+                            "rating": _rating(item),
+                            "quantity": 1,
+                        }
+                    )
+
+                return {
+                    "success": bool(selected),
+                    "selected": selected,
+                    "missing": missing,
+                }
+
+
+def resolve_product_queries_sync(
+    queries: list[str],
+    access_token: str | None = None,
+) -> dict:
+    return asyncio.run(
+        resolve_product_queries(queries, access_token=access_token)
+    )
+
+
+async def create_cart_link_from_items(
+    items: list[dict],
+    access_token: str | None = None,
+) -> dict:
+    products = []
+    for item in items:
+        try:
+            xml_id = int(item.get("xml_id"))
+            quantity = float(item.get("quantity") or 1)
+        except (TypeError, ValueError):
+            continue
+        if quantity <= 0:
+            continue
+        products.append({"xml_id": xml_id, "q": quantity})
+
+    if not products:
+        return {"success": False, "message": "Корзина пуста."}
+
+    headers = {}
+    if access_token:
+        headers["Authorization"] = "Bearer " + access_token
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=httpx.Timeout(20.0, read=60.0),
+    ) as http_client:
+        async with streamable_http_client(
+            MCP_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "vkusvill_cart_link_create",
+                    {"products": products},
+                )
+                payload = _extract_payload(result)
+
+    url = None
+    if isinstance(payload, dict):
+        url = payload.get("url") or payload.get("cart_url") or payload.get("link")
+    elif isinstance(payload, str):
+        match = re.search(r"https?://[^\s\"']+", payload)
+        url = match.group(0) if match else None
+
+    if not url:
+        blob = json.dumps(payload, ensure_ascii=False)
+        match = re.search(r"https?://[^\s\"']+", blob)
+        url = match.group(0) if match else None
+
+    return {"success": bool(url), "cart_url": url}
+
+
+def create_cart_link_from_items_sync(
+    items: list[dict],
+    access_token: str | None = None,
+) -> dict:
+    return asyncio.run(
+        create_cart_link_from_items(items, access_token=access_token)
+    )
+
+
 async def diagnose_vkusvill_mcp() -> dict:
     async with streamable_http_client(MCP_URL) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
