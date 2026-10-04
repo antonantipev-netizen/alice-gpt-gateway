@@ -204,3 +204,22 @@ async def build_cart_direct(user_text: str) -> dict:
 
 def build_cart_direct_sync(user_text: str) -> dict:
     return asyncio.run(build_cart_direct(user_text))
+
+
+async def diagnose_vkusvill_mcp() -> dict:
+    async with streamable_http_client(MCP_URL) as (read_stream, write_stream, _):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            tools = []
+            for tool in result.tools:
+                tools.append({
+                    "name": tool.name,
+                    "description": (getattr(tool, "description", "") or "")[:400],
+                    "inputSchema": getattr(tool, "inputSchema", None),
+                })
+            return {"success": True, "tools": tools}
+
+
+def diagnose_vkusvill_mcp_sync() -> dict:
+    return asyncio.run(diagnose_vkusvill_mcp())

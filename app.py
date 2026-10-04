@@ -5,8 +5,9 @@ from pathlib import Path
 from threading import Lock, Thread
 
 import requests
+import httpx
 from flask import Flask, jsonify, request
-from vkusvill_direct import build_cart_direct_sync
+from vkusvill_direct import build_cart_direct_sync, diagnose_vkusvill_mcp_sync
 
 app = Flask(__name__)
 
@@ -43,6 +44,43 @@ def _probe_vkusvill_oauth_metadata():
             )
         except Exception as exc:
             print(f"VKOAUTH_PROBE url={url} error={exc}", flush=True)
+
+    try:
+        for url in [
+            "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
+            "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
+            "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
+        ]:
+            try:
+                r = httpx.get(
+                    url,
+                    timeout=8.0,
+                    follow_redirects=False,
+                    headers={"Accept": "application/json"},
+                )
+                safe_headers = {
+                    k: v for k, v in r.headers.items()
+                    if k.lower() in {
+                        "www-authenticate", "location", "content-type",
+                        "server", "allow"
+                    }
+                }
+                print(
+                    f"VKOAUTH_HTTPX url={url} status={r.status_code} "
+                    f"headers={safe_headers!r} body={r.text[:2000]!r}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"VKOAUTH_HTTPX url={url} error={exc}", flush=True)
+
+        diag = diagnose_vkusvill_mcp_sync()
+        tool_names = [x.get("name") for x in diag.get("tools", [])]
+        print(f"VKOAUTH_MCP_TOOLS count={len(tool_names)} names={tool_names!r}", flush=True)
+        for tool in diag.get("tools", []):
+            if any(k in (tool.get("name") or "").lower() for k in ("order", "history", "discount", "recommend", "favorite")):
+                print(f"VKOAUTH_MCP_TOOL_DETAIL {tool!r}", flush=True)
+    except Exception as exc:
+        print(f"VKOAUTH_MCP_TOOLS error={exc}", flush=True)
 
     try:
         direct = build_cart_direct_sync("молоко")
