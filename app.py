@@ -10,6 +10,27 @@ from vkusvill_direct import build_cart_direct_sync
 
 app = Flask(__name__)
 
+def _probe_vkusvill_oauth_metadata():
+    if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") != "1":
+        return
+    urls = [
+        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
+        "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
+        "https://mcp.vkusvill.ru/.well-known/openid-configuration",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=8, allow_redirects=True)
+            print(
+                f"VKOAUTH_PROBE url={url} status={resp.status_code} final={resp.url} body={resp.text[:1500]!r}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"VKOAUTH_PROBE url={url} error={exc}", flush=True)
+
+if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") == "1":
+    Thread(target=_probe_vkusvill_oauth_metadata, daemon=True).start()
+
 VKUSVILL_JOBS = {}
 VKUSVILL_JOBS_LOCK = Lock()
 
