@@ -1,0 +1,14 @@
+services:
+  jarvis-checkout-worker:
+    build: .
+    container_name: jarvis-checkout-worker
+    restart: unless-stopped
+    environment:
+      GATEWAY_URL: "https://alice-gpt-gateway.onrender.com"
+      WORKER_TOKEN: "${WORKER_TOKEN}"
+      POLL_SECONDS: "5"
+      HEADLESS: "1"
+      BROWSER_DATA_DIR: "/data/browser"
+      SCREENSHOT_PATH: "/data/last_checkout.png"
+    volumes:
+      - ./data:/data
