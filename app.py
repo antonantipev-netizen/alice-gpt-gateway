@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 import requests
 import httpx
+import redis
 from flask import Flask, jsonify, request, redirect
 from vkusvill_direct import build_cart_direct_sync
 
@@ -43,6 +44,8 @@ VKUSVILL_OAUTH_TOKEN_PATH = Path(
     os.getenv("VKUSVILL_OAUTH_TOKEN_PATH", "/tmp/vkusvill_oauth_token.json")
 )
 VKUSVILL_OAUTH_STATE_MAX_AGE = 15 * 60
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+VKUSVILL_OAUTH_REDIS_KEY = "jarvis:vkusvill:oauth_tokens"
 
 WORK_CONTEXT_PATH = Path(os.getenv("WORK_CONTEXT_PATH", "work_context.json"))
 
@@ -848,6 +851,23 @@ def _read_vkusvill_oauth_state(state: str) -> str:
         raise ValueError("invalid or expired OAuth state") from exc
 
 
+def _get_redis_client():
+    if not REDIS_URL:
+        return None
+    try:
+        client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+        return client
+    except Exception as exc:
+        print(f"Redis unavailable for VkusVill OAuth: {type(exc).__name__}", flush=True)
+        return None
+
+
 def _save_vkusvill_tokens(tokens: dict) -> None:
     payload = dict(tokens)
     payload["saved_at"] = int(time.time())
@@ -857,14 +877,37 @@ def _save_vkusvill_tokens(tokens: dict) -> None:
     except (TypeError, ValueError):
         payload["expires_at"] = None
 
+    serialized = json.dumps(payload, ensure_ascii=False)
+
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            client.set(VKUSVILL_OAUTH_REDIS_KEY, serialized)
+            print("VkusVill OAuth tokens saved to Redis", flush=True)
+            return
+        except Exception as exc:
+            print(f"Redis token save failed: {type(exc).__name__}", flush=True)
+
     VKUSVILL_OAUTH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = VKUSVILL_OAUTH_TOKEN_PATH.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp_path.write_text(serialized, encoding="utf-8")
     os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, VKUSVILL_OAUTH_TOKEN_PATH)
+    print("VkusVill OAuth tokens saved to local fallback", flush=True)
 
 
 def _load_vkusvill_tokens() -> dict:
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            raw = client.get(VKUSVILL_OAUTH_REDIS_KEY)
+            if raw:
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    return payload
+        except Exception as exc:
+            print(f"Redis token load failed: {type(exc).__name__}", flush=True)
+
     try:
         payload = json.loads(VKUSVILL_OAUTH_TOKEN_PATH.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else {}
@@ -878,12 +921,14 @@ def _vkusvill_oauth_public_status() -> dict:
     remaining = None
     if isinstance(expires_at, int):
         remaining = max(0, expires_at - int(time.time()))
+    redis_client = _get_redis_client()
     return {
         "oauth_configured": _oauth_configured(),
         "connected": bool(tokens.get("access_token")),
         "refresh_token_present": bool(tokens.get("refresh_token")),
         "scope": tokens.get("scope"),
         "expires_in_seconds": remaining,
+        "token_storage": "redis" if redis_client is not None else "local_fallback",
     }
 
 
