@@ -13,20 +13,73 @@ app = Flask(__name__)
 def _probe_vkusvill_oauth_metadata():
     if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") != "1":
         return
+
     urls = [
+        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
+        "https://mcp.vkusvill.ru/mcp/.well-known/oauth-protected-resource",
         "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
         "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
         "https://mcp.vkusvill.ru/.well-known/openid-configuration",
     ]
     for url in urls:
         try:
-            resp = requests.get(url, timeout=8, allow_redirects=True)
+            resp = requests.get(
+                url,
+                timeout=8,
+                allow_redirects=False,
+                headers={"Accept": "application/json"},
+            )
+            safe_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() in {
+                    "www-authenticate", "location", "content-type",
+                    "server", "allow"
+                }
+            }
             print(
-                f"VKOAUTH_PROBE url={url} status={resp.status_code} final={resp.url} body={resp.text[:1500]!r}",
+                f"VKOAUTH_PROBE url={url} status={resp.status_code} "
+                f"headers={safe_headers!r} body={resp.text[:1500]!r}",
                 flush=True,
             )
         except Exception as exc:
             print(f"VKOAUTH_PROBE url={url} error={exc}", flush=True)
+
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "jarvis-oauth-probe", "version": "1.0"},
+            },
+        }
+        resp = requests.post(
+            "https://mcp.vkusvill.ru/mcp",
+            json=payload,
+            timeout=12,
+            allow_redirects=False,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        safe_headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() in {
+                "www-authenticate", "location", "content-type",
+                "server", "allow", "mcp-session-id"
+            }
+        }
+        print(
+            f"VKOAUTH_MCP_INIT status={resp.status_code} "
+            f"headers={safe_headers!r} body={resp.text[:2500]!r}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"VKOAUTH_MCP_INIT error={exc}", flush=True)
+
 
 if os.getenv("VKUSVILL_OAUTH_DISCOVERY_PROBE") == "1":
     Thread(target=_probe_vkusvill_oauth_metadata, daemon=True).start()
