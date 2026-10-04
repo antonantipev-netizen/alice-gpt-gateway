@@ -680,7 +680,12 @@ def is_vkusvill_status_intent(text: str) -> bool:
 def start_vkusvill_job(job_key: str, user_text: str) -> None:
     def worker():
         try:
-            direct = build_cart_direct_sync(user_text)
+            oauth_tokens = _load_vkusvill_tokens()
+            access_token = str(oauth_tokens.get("access_token") or "")
+            direct = build_cart_direct_sync(
+                user_text,
+                access_token=access_token or None,
+            )
             if direct.get("success") and direct.get("cart_url"):
                 names = [item.get("name") for item in direct.get("selected", []) if item.get("name")]
                 summary = ", ".join(names[:6])
@@ -689,7 +694,12 @@ def start_vkusvill_job(job_key: str, user_text: str) -> None:
                     result += f" Добавил: {summary}."
                 result += f" {direct['cart_url']}"
                 payload = {"status": "done", "result": result}
-                print(f"VkusVill direct success: items={len(names)} url={direct['cart_url']}", flush=True)
+                print(
+                    f"VkusVill direct success: items={len(names)} "
+                    f"authenticated={bool(access_token)} "
+                    f"url={direct['cart_url']}",
+                    flush=True,
+                )
             else:
                 payload = {"status": "error", "error": direct.get("message") or "cart_not_created"}
                 print(f"VkusVill direct failed: {direct}", flush=True)
