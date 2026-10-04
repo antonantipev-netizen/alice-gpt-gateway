@@ -45,6 +45,18 @@ def _probe_vkusvill_oauth_metadata():
             print(f"VKOAUTH_PROBE url={url} error={exc}", flush=True)
 
     try:
+        direct = build_cart_direct_sync("молоко")
+        print(
+            f"VKOAUTH_REAL_MCP success={bool(direct.get('success'))} "
+            f"items={len(direct.get('selected', []))} "
+            f"url_present={bool(direct.get('cart_url'))} "
+            f"message={direct.get('message', '')!r}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"VKOAUTH_REAL_MCP error={exc}", flush=True)
+
+    try:
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
