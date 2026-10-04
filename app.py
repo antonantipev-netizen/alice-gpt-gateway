@@ -931,6 +931,83 @@ def vkusvill_oauth_callback():
     )
 
 
+@app.get("/vkusvill/oauth/diagnostic")
+def vkusvill_oauth_diagnostic():
+    results = []
+    urls = [
+        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource/mcp",
+        "https://mcp.vkusvill.ru/mcp/.well-known/oauth-protected-resource",
+        "https://mcp.vkusvill.ru/.well-known/oauth-protected-resource",
+        "https://mcp.vkusvill.ru/.well-known/oauth-authorization-server",
+        "https://mcp.vkusvill.ru/.well-known/openid-configuration",
+    ]
+
+    for url in urls:
+        item = {"url": url}
+        try:
+            resp = requests.get(
+                url,
+                timeout=8,
+                allow_redirects=False,
+                headers={"Accept": "application/json"},
+            )
+            item["status"] = resp.status_code
+            item["headers"] = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() in {
+                    "www-authenticate", "location", "content-type",
+                    "server", "allow"
+                }
+            }
+            body = resp.text[:3000]
+            if "application/json" in resp.headers.get("content-type", ""):
+                try:
+                    item["json"] = resp.json()
+                except Exception:
+                    item["body"] = body
+            else:
+                item["body"] = body
+        except Exception as exc:
+            item["error"] = str(exc)
+        results.append(item)
+
+    mcp = {"url": "https://mcp.vkusvill.ru/mcp"}
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "jarvis-oauth-diagnostic", "version": "1.0"},
+            },
+        }
+        resp = requests.post(
+            mcp["url"],
+            json=payload,
+            timeout=12,
+            allow_redirects=False,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+        )
+        mcp["status"] = resp.status_code
+        mcp["headers"] = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() in {
+                "www-authenticate", "location", "content-type",
+                "server", "allow", "mcp-session-id"
+            }
+        }
+        mcp["body"] = resp.text[:4000]
+    except Exception as exc:
+        mcp["error"] = str(exc)
+
+    return jsonify({"checks": results, "mcp_initialize": mcp})
+
+
 @app.get("/vkusvill-direct")
 def vkusvill_direct():
     text = request.args.get("q", "").strip()
