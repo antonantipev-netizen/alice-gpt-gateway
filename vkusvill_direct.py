@@ -9,7 +9,11 @@ from typing import Any
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-MCP_URL = "https://mcp.vkusvill.ru/mcp"\nGROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()\nGROQ_URL = "https://api.groq.com/openai/v1/chat/completions"\nGROQ_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-20b")\n
+MCP_URL = "https://mcp.vkusvill.ru/mcp"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.getenv("GROQ_PRIMARY_MODEL", "openai/gpt-oss-20b")
+
 
 def _extract_payload(tool_result: Any) -> Any:
     structured = getattr(tool_result, "structuredContent", None)
