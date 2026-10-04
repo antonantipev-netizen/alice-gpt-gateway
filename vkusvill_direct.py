@@ -1,6 +1,8 @@
 import asyncio
 import json
 import re
+
+import httpx
 from typing import Any
 
 from mcp import ClientSession
@@ -223,3 +225,68 @@ async def diagnose_vkusvill_mcp() -> dict:
 
 def diagnose_vkusvill_mcp_sync() -> dict:
     return asyncio.run(diagnose_vkusvill_mcp())
+
+
+async def check_authenticated_vkusvill(access_token: str) -> dict:
+    if not access_token:
+        return {"success": False, "reason": "missing_access_token"}
+
+    async with httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=httpx.Timeout(20.0, read=60.0),
+    ) as http_client:
+        async with streamable_http_client(
+            MCP_URL,
+            http_client=http_client,
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                tools_result = await session.list_tools()
+                tool_names = [tool.name for tool in tools_result.tools]
+                if "vkusvill_orders_history" not in tool_names:
+                    return {
+                        "success": False,
+                        "reason": "orders_history_tool_missing",
+                        "tool_count": len(tool_names),
+                    }
+
+                result = await session.call_tool(
+                    "vkusvill_orders_history",
+                    {"page": 1},
+                )
+                if getattr(result, "isError", False):
+                    return {
+                        "success": False,
+                        "reason": "orders_history_tool_error",
+                        "tool_count": len(tool_names),
+                    }
+
+                payload = _extract_payload(result)
+                orders = []
+                if isinstance(payload, list):
+                    orders = [x for x in payload if isinstance(x, dict)]
+                elif isinstance(payload, dict):
+                    for key in ("orders", "items", "results", "data"):
+                        value = payload.get(key)
+                        if isinstance(value, list):
+                            orders = [x for x in value if isinstance(x, dict)]
+                            break
+                        if isinstance(value, dict):
+                            for nested_key in ("orders", "items", "results"):
+                                nested = value.get(nested_key)
+                                if isinstance(nested, list):
+                                    orders = [x for x in nested if isinstance(x, dict)]
+                                    break
+                            if orders:
+                                break
+
+                return {
+                    "success": True,
+                    "tool_count": len(tool_names),
+                    "orders_history_available": True,
+                    "orders_returned": len(orders),
+                }
+
+
+def check_authenticated_vkusvill_sync(access_token: str) -> dict:
+    return asyncio.run(check_authenticated_vkusvill(access_token))
